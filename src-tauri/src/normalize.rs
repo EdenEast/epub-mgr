@@ -183,6 +183,7 @@ fn build_entry(
     };
 
     let mut warnings = metadata.missing_required_warnings();
+    warnings.extend(metadata.warnings.clone());
     let output_path_metadata = output_path_metadata(&metadata);
 
     match render_output_path(&config.output_path_template, &output_path_metadata) {
@@ -314,8 +315,8 @@ fn output_path_metadata(metadata: &NormalizedMetadata) -> OutputPathMetadata {
         author: metadata.authors.first().cloned(),
         authors: (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
         author_sort: metadata.authors.first().cloned(),
-        series: None,
-        series_index: None,
+        series: metadata.series.clone(),
+        series_index: metadata.series_index.clone(),
         language: metadata.language.clone(),
         identifier: metadata
             .identifiers
@@ -798,6 +799,86 @@ mod tests {
                     .join("Author One/Extracted Title.epub")
             )
         );
+    }
+
+    #[test]
+    fn dry_run_uses_embedded_series_metadata_in_default_planned_path_and_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Series Title</dc:title>
+                <dc:creator>Series Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="series-id">Planned Series</meta>
+                <meta property="collection-type" refines="#series-id">series</meta>
+                <meta property="group-position" refines="#series-id">1</meta>
+              </metadata>
+            </package>"##,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: output_library.clone(),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(output_library.join("Series Author/Planned Series/01 Series Title.epub"))
+        );
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("Planned Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("1"));
+        let json = serde_json::to_value(metadata).expect("serialize metadata");
+        assert_eq!(json["series"], "Planned Series");
+        assert_eq!(json["series_index"], "1");
+        assert!(report.entries[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn dry_run_includes_series_warnings_in_report_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Conflict Title</dc:title>
+                <dc:creator>Conflict Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="series-id">EPUB Series</meta>
+                <meta property="collection-type" refines="#series-id">series</meta>
+                <meta property="group-position" refines="#series-id">7</meta>
+                <meta name="calibre:series" content="Calibre Series"/>
+                <meta name="calibre:series_index" content="8"/>
+              </metadata>
+            </package>"##,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.entries[0].warnings, vec!["series_conflict"]);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("EPUB Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("7"));
     }
 
     #[test]
