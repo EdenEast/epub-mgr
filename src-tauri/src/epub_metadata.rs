@@ -9,6 +9,8 @@ use serde::Serialize;
 use zip::ZipArchive;
 
 const DUBLIN_CORE_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
+const AMBIGUOUS_SERIES_WARNING: &str = "ambiguous_series";
+const SERIES_CONFLICT_WARNING: &str = "series_conflict";
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct NormalizedMetadata {
@@ -16,6 +18,10 @@ pub struct NormalizedMetadata {
     pub authors: Vec<String>,
     pub language: Option<String>,
     pub identifiers: Vec<MetadataIdentifier>,
+    pub series: Option<String>,
+    pub series_index: Option<String>,
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 impl NormalizedMetadata {
@@ -182,7 +188,7 @@ fn parse_package_metadata(
     let mut in_metadata = false;
     let mut metadata_depth = 0usize;
     let mut current = None;
-    let mut current_role_refinement = None;
+    let mut current_meta = None;
     let mut parsed = ParsedPackage::default();
 
     loop {
@@ -208,9 +214,8 @@ fn parse_package_metadata(
                     {
                         current = Some(target);
                     } else if element_name == b"meta" {
-                        current_role_refinement =
-                            role_refinement_from_element(&reader, &element)
-                                .map_err(|message| package_xml_error(package_path, message))?;
+                        current_meta = meta_target_from_element(&reader, &element)
+                            .map_err(|message| package_xml_error(package_path, message))?;
                     }
                 }
             }
@@ -222,8 +227,11 @@ fn parse_package_metadata(
                     unique_identifier_id = attribute_value(&reader, &element, b"unique-identifier")
                         .map_err(|message| package_xml_error(package_path, message))?;
                 } else if in_metadata && element_name == b"meta" {
-                    let _ = role_refinement_from_element(&reader, &element)
-                        .map_err(|message| package_xml_error(package_path, message))?;
+                    if let Some(meta) = meta_target_from_element(&reader, &element)
+                        .map_err(|message| package_xml_error(package_path, message))?
+                    {
+                        parsed.push_meta_target(meta);
+                    }
                 }
             }
             Ok(Event::Text(text)) => {
@@ -232,13 +240,13 @@ fn parse_package_metadata(
                     .map_err(|error| package_xml_error(package_path, error.to_string()))?;
                 let unescaped = unescape(&decoded)
                     .map_err(|error| package_xml_error(package_path, error.to_string()))?;
-                append_text(&mut current, &mut current_role_refinement, &unescaped);
+                append_text(&mut current, &mut current_meta, &unescaped);
             }
             Ok(Event::CData(text)) => {
                 let decoded = text
                     .decode()
                     .map_err(|error| package_xml_error(package_path, error.to_string()))?;
-                append_text(&mut current, &mut current_role_refinement, &decoded);
+                append_text(&mut current, &mut current_meta, &decoded);
             }
             Ok(Event::End(element)) => {
                 let name = element.name();
@@ -253,8 +261,8 @@ fn parse_package_metadata(
                             parsed.push_text_target(target);
                         }
                     } else if element_name == b"meta" {
-                        if let Some(refinement) = current_role_refinement.take() {
-                            parsed.push_role_refinement(refinement);
+                        if let Some(meta) = current_meta.take() {
+                            parsed.push_meta_target(meta);
                         }
                     }
 
@@ -269,7 +277,7 @@ fn parse_package_metadata(
                 namespaces.pop();
             }
             Ok(Event::Eof) => {
-                if in_metadata || current.is_some() || current_role_refinement.is_some() {
+                if in_metadata || current.is_some() || current_meta.is_some() {
                     return Err(package_xml_error(
                         package_path,
                         "unexpected end of package document".to_string(),
@@ -294,14 +302,14 @@ fn package_xml_error(package_path: &str, message: String) -> EpubMetadataError {
 
 fn append_text(
     current: &mut Option<TextTarget>,
-    role_refinement: &mut Option<RoleRefinement>,
+    current_meta: &mut Option<MetaTarget>,
     text: &str,
 ) {
     if let Some(target) = current {
         target.text.push_str(text);
     }
-    if let Some(refinement) = role_refinement {
-        refinement.role.push_str(text);
+    if let Some(meta) = current_meta {
+        meta.text.push_str(text);
     }
 }
 
@@ -336,24 +344,65 @@ fn text_target_from_element(
     }
 }
 
-fn role_refinement_from_element(
+fn meta_target_from_element(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
-) -> Result<Option<RoleRefinement>, String> {
+) -> Result<Option<MetaTarget>, String> {
     let property = attribute_value(reader, element, b"property")?;
     let refines = attribute_value(reader, element, b"refines")?;
+    let id = attribute_value(reader, element, b"id")?;
+    let name = attribute_value(reader, element, b"name")?;
+    let content = attribute_value(reader, element, b"content")?.unwrap_or_default();
 
-    Ok(match (property, refines) {
-        (Some(property), Some(refines))
-            if property.trim() == "role" && refines.trim().starts_with('#') =>
-        {
-            Some(RoleRefinement {
-                creator_id: refines.trim().trim_start_matches('#').to_string(),
-                role: String::new(),
-            })
+    if let Some(name) = name.as_deref().map(str::trim) {
+        match name {
+            "calibre:series" => {
+                return Ok(Some(MetaTarget {
+                    kind: MetaKind::CalibreSeries,
+                    text: content,
+                }))
+            }
+            "calibre:series_index" => {
+                return Ok(Some(MetaTarget {
+                    kind: MetaKind::CalibreSeriesIndex,
+                    text: content,
+                }))
+            }
+            _ => {}
         }
-        _ => None,
-    })
+    }
+
+    let refined_target_id = refines.as_deref().and_then(refined_target_id);
+
+    Ok(
+        match (property.as_deref().map(str::trim), refined_target_id) {
+            (Some("role"), Some(creator_id)) => Some(MetaTarget {
+                kind: MetaKind::RoleRefinement { creator_id },
+                text: String::new(),
+            }),
+            (Some("belongs-to-collection"), _) => id.map(|id| MetaTarget {
+                kind: MetaKind::Epub3Collection { id },
+                text: String::new(),
+            }),
+            (Some("collection-type"), Some(collection_id)) => Some(MetaTarget {
+                kind: MetaKind::CollectionType { collection_id },
+                text: String::new(),
+            }),
+            (Some("group-position"), Some(collection_id)) => Some(MetaTarget {
+                kind: MetaKind::GroupPosition { collection_id },
+                text: String::new(),
+            }),
+            _ => None,
+        },
+    )
+}
+
+fn refined_target_id(refines: &str) -> Option<String> {
+    refines
+        .trim()
+        .strip_prefix('#')
+        .filter(|target_id| !target_id.is_empty())
+        .map(ToString::to_string)
 }
 
 fn attribute_value(
@@ -483,6 +532,10 @@ struct ParsedPackage {
     language: Option<String>,
     identifiers: Vec<Identifier>,
     role_refinements: HashMap<String, Vec<String>>,
+    epub3_collections: Vec<Epub3Collection>,
+    collection_refinements: HashMap<String, CollectionRefinement>,
+    calibre_series: Option<String>,
+    calibre_series_index: Option<String>,
 }
 
 impl ParsedPackage {
@@ -509,19 +562,52 @@ impl ParsedPackage {
         }
     }
 
-    fn push_role_refinement(&mut self, refinement: RoleRefinement) {
-        let role = refinement.role.trim();
-        if role.is_empty() {
+    fn push_meta_target(&mut self, meta: MetaTarget) {
+        let text = meta.text.trim();
+        if text.is_empty() {
             return;
         }
 
-        self.role_refinements
-            .entry(refinement.creator_id)
-            .or_default()
-            .push(role.to_string());
+        match meta.kind {
+            MetaKind::RoleRefinement { creator_id } => {
+                self.role_refinements
+                    .entry(creator_id)
+                    .or_default()
+                    .push(text.to_string());
+            }
+            MetaKind::Epub3Collection { id } => self.epub3_collections.push(Epub3Collection {
+                id,
+                name: text.to_string(),
+            }),
+            MetaKind::CollectionType { collection_id } => {
+                self.collection_refinements
+                    .entry(collection_id)
+                    .or_default()
+                    .collection_type = Some(text.to_string());
+            }
+            MetaKind::GroupPosition { collection_id } => {
+                self.collection_refinements
+                    .entry(collection_id)
+                    .or_default()
+                    .group_position = Some(text.to_string());
+            }
+            MetaKind::CalibreSeries if self.calibre_series.is_none() => {
+                self.calibre_series = Some(text.to_string());
+            }
+            MetaKind::CalibreSeriesIndex if self.calibre_series_index.is_none() => {
+                self.calibre_series_index = Some(text.to_string());
+            }
+            _ => {}
+        }
     }
 
     fn into_normalized(self, unique_identifier_id: Option<&str>) -> NormalizedMetadata {
+        let SeriesSelection {
+            series,
+            series_index,
+            warnings,
+        } = self.select_series();
+
         let authors = self
             .creators
             .into_iter()
@@ -546,6 +632,73 @@ impl ParsedPackage {
             authors,
             language: self.language,
             identifiers,
+            series,
+            series_index,
+            warnings,
+        }
+    }
+
+    fn select_series(&self) -> SeriesSelection {
+        let supported_epub3_series: Vec<SeriesValue> = self
+            .epub3_collections
+            .iter()
+            .filter_map(|collection| {
+                let refinement = self.collection_refinements.get(&collection.id)?;
+                refinement
+                    .collection_type
+                    .as_deref()
+                    .is_some_and(|collection_type| {
+                        collection_type.trim().eq_ignore_ascii_case("series")
+                    })
+                    .then(|| SeriesValue {
+                        series: collection.name.clone(),
+                        series_index: refinement
+                            .group_position
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|position| !position.is_empty())
+                            .map(ToString::to_string),
+                    })
+            })
+            .collect();
+
+        let calibre = self.calibre_series.as_ref().map(|series| SeriesValue {
+            series: series.clone(),
+            series_index: self.calibre_series_index.clone(),
+        });
+
+        let mut warnings = Vec::new();
+
+        if let Some(epub3) = supported_epub3_series.first() {
+            if supported_epub3_series.len() > 1 {
+                push_warning_once(&mut warnings, AMBIGUOUS_SERIES_WARNING);
+            }
+            if calibre
+                .as_ref()
+                .is_some_and(|calibre| series_values_conflict(epub3, calibre))
+            {
+                push_warning_once(&mut warnings, SERIES_CONFLICT_WARNING);
+            }
+
+            return SeriesSelection {
+                series: Some(epub3.series.clone()),
+                series_index: epub3.series_index.clone(),
+                warnings,
+            };
+        }
+
+        if let Some(calibre) = calibre {
+            return SeriesSelection {
+                series: Some(calibre.series),
+                series_index: calibre.series_index,
+                warnings,
+            };
+        }
+
+        SeriesSelection {
+            series: None,
+            series_index: None,
+            warnings,
         }
     }
 }
@@ -621,9 +774,55 @@ struct Identifier {
     scheme: Option<String>,
 }
 
-struct RoleRefinement {
-    creator_id: String,
-    role: String,
+struct MetaTarget {
+    kind: MetaKind,
+    text: String,
+}
+
+enum MetaKind {
+    RoleRefinement { creator_id: String },
+    Epub3Collection { id: String },
+    CollectionType { collection_id: String },
+    GroupPosition { collection_id: String },
+    CalibreSeries,
+    CalibreSeriesIndex,
+}
+
+struct Epub3Collection {
+    id: String,
+    name: String,
+}
+
+#[derive(Default)]
+struct CollectionRefinement {
+    collection_type: Option<String>,
+    group_position: Option<String>,
+}
+
+struct SeriesValue {
+    series: String,
+    series_index: Option<String>,
+}
+
+struct SeriesSelection {
+    series: Option<String>,
+    series_index: Option<String>,
+    warnings: Vec<String>,
+}
+
+fn series_values_conflict(epub3: &SeriesValue, calibre: &SeriesValue) -> bool {
+    epub3.series != calibre.series
+        || epub3
+            .series_index
+            .as_ref()
+            .zip(calibre.series_index.as_ref())
+            .is_some_and(|(epub3_index, calibre_index)| epub3_index != calibre_index)
+}
+
+fn push_warning_once(warnings: &mut Vec<String>, warning: &str) {
+    if !warnings.iter().any(|existing| existing == warning) {
+        warnings.push(warning.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -738,6 +937,142 @@ mod tests {
         assert_eq!(metadata.authors, vec!["Default Namespace Author"]);
         assert_eq!(metadata.language.as_deref(), Some("en"));
         assert_eq!(metadata.identifiers[0].value, "default-id");
+    }
+
+    #[test]
+    fn reads_epub3_collection_series_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Series Book</dc:title>
+                <dc:creator>Series Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="collection-1">Epic Cycle</meta>
+                <meta property="collection-type" refines="#collection-1">series</meta>
+                <meta property="group-position" refines="#collection-1">1</meta>
+              </metadata>
+            </package>"##,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series.as_deref(), Some("Epic Cycle"));
+        assert_eq!(metadata.series_index.as_deref(), Some("1"));
+        assert!(metadata.warnings.is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_calibre_series_metadata_without_epub3_series() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Calibre Book</dc:title>
+                <dc:creator>Calibre Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta name="calibre:series" content="Fallback Saga"/>
+                <meta name="calibre:series_index" content="2"/>
+              </metadata>
+            </package>"#,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series.as_deref(), Some("Fallback Saga"));
+        assert_eq!(metadata.series_index.as_deref(), Some("2"));
+        assert!(metadata.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_and_chooses_first_epub3_series_when_multiple_are_supported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Ambiguous Book</dc:title>
+                <dc:creator>Ambiguous Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="first">First Series</meta>
+                <meta property="collection-type" refines="#first">series</meta>
+                <meta property="group-position" refines="#first">3</meta>
+                <meta property="belongs-to-collection" id="second">Second Series</meta>
+                <meta property="collection-type" refines="#second">series</meta>
+                <meta property="group-position" refines="#second">4</meta>
+              </metadata>
+            </package>"##,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series.as_deref(), Some("First Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("3"));
+        assert_eq!(metadata.warnings, vec!["ambiguous_series"]);
+    }
+
+    #[test]
+    fn ignores_unpaired_calibre_series_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Standalone Index</dc:title>
+                <dc:creator>Index Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta name="calibre:series_index" content="3"/>
+              </metadata>
+            </package>"#,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series, None);
+        assert_eq!(metadata.series_index, None);
+    }
+
+    #[test]
+    fn warns_and_prefers_epub3_series_when_calibre_disagrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Conflict Book</dc:title>
+                <dc:creator>Conflict Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="epub3">Preferred Series</meta>
+                <meta property="collection-type" refines="#epub3">series</meta>
+                <meta property="group-position" refines="#epub3">5</meta>
+                <meta name="calibre:series" content="Other Series"/>
+                <meta name="calibre:series_index" content="6"/>
+              </metadata>
+            </package>"##,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series.as_deref(), Some("Preferred Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("5"));
+        assert_eq!(metadata.warnings, vec!["series_conflict"]);
     }
 
     #[test]

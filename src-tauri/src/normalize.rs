@@ -183,17 +183,19 @@ fn build_entry(
     };
 
     let mut warnings = metadata.missing_required_warnings();
+    warnings.extend(metadata.warnings.clone());
     let output_path_metadata = output_path_metadata(&metadata);
 
     match render_output_path(&config.output_path_template, &output_path_metadata) {
         Ok(rendered) => {
             warnings.extend(rendered.warnings);
-            let output_path = config.output_library.join(rendered.relative_path);
+            let relative_output_path = rendered.relative_path;
+            let final_output_path = config.output_library.join(&relative_output_path);
 
-            if !planned_output_paths.insert(output_path.clone()) {
+            if !planned_output_paths.insert(relative_output_path.clone()) {
                 return skipped_entry(
                     source_path,
-                    output_path,
+                    relative_output_path,
                     metadata,
                     warnings,
                     "run_collision",
@@ -204,7 +206,7 @@ fn build_entry(
             if config.dry_run {
                 return ReportEntry {
                     source_path,
-                    output_path: Some(output_path),
+                    output_path: Some(relative_output_path),
                     action: EntryAction::WouldCopy,
                     metadata: Some(metadata),
                     warnings,
@@ -212,7 +214,13 @@ fn build_entry(
                 };
             }
 
-            copy_entry(source_path, output_path, metadata, warnings)
+            copy_entry(
+                source_path,
+                final_output_path,
+                relative_output_path,
+                metadata,
+                warnings,
+            )
         }
         Err(error) => ReportEntry {
             source_path,
@@ -230,14 +238,15 @@ fn build_entry(
 
 fn copy_entry(
     source_path: PathBuf,
-    output_path: PathBuf,
+    final_output_path: PathBuf,
+    report_output_path: PathBuf,
     metadata: NormalizedMetadata,
     warnings: Vec<String>,
 ) -> ReportEntry {
-    match copy_cleaned_epub(&source_path, &output_path) {
+    match copy_cleaned_epub(&source_path, &final_output_path) {
         Ok(CopyOutcome::Copied) => ReportEntry {
             source_path,
-            output_path: Some(output_path),
+            output_path: Some(report_output_path),
             action: EntryAction::Copied,
             metadata: Some(metadata),
             warnings,
@@ -245,7 +254,7 @@ fn copy_entry(
         },
         Ok(CopyOutcome::OutputExists) => skipped_entry(
             source_path,
-            output_path,
+            report_output_path,
             metadata,
             warnings,
             "output_exists",
@@ -253,7 +262,7 @@ fn copy_entry(
         ),
         Err(error) => ReportEntry {
             source_path,
-            output_path: Some(output_path),
+            output_path: Some(report_output_path),
             action: EntryAction::Error,
             metadata: Some(metadata),
             warnings,
@@ -314,8 +323,8 @@ fn output_path_metadata(metadata: &NormalizedMetadata) -> OutputPathMetadata {
         author: metadata.authors.first().cloned(),
         authors: (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
         author_sort: metadata.authors.first().cloned(),
-        series: None,
-        series_index: None,
+        series: metadata.series.clone(),
+        series_index: metadata.series_index.clone(),
         language: metadata.language.clone(),
         identifier: metadata
             .identifiers
@@ -404,14 +413,30 @@ pub fn is_epub(path: &std::path::Path) -> bool {
 }
 
 pub fn human_summary(report: &NormalizeReport) -> String {
-    format!(
+    let mut summary = format!(
         "normalize summary: scanned={} planned={} copied={} skipped={} errored={}",
         report.totals.scanned,
         report.totals.planned,
         report.totals.copied,
         report.totals.skipped,
         report.totals.errored
-    )
+    );
+
+    if report.config.dry_run {
+        for entry in &report.entries {
+            if entry.action == EntryAction::WouldCopy {
+                if let Some(output_path) = &entry.output_path {
+                    summary.push_str(&format!(
+                        "\nwould copy: {} -> {}",
+                        entry.source_path.display(),
+                        output_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    summary
 }
 
 pub fn write_json_report(
@@ -573,7 +598,10 @@ mod tests {
         assert_eq!(report.totals.skipped, 0);
         assert_eq!(report.totals.errored, 0);
         assert_eq!(report.entries[0].action, EntryAction::Copied);
-        assert_eq!(report.entries[0].output_path, Some(output_path));
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(PathBuf::from("Test Author/Copied Book.epub"))
+        );
         assert!(report.entries[0].error.is_none());
     }
 
@@ -792,12 +820,90 @@ mod tests {
         assert!(metadata.identifiers[0].is_unique);
         assert_eq!(
             report.entries[0].output_path,
-            Some(
-                temp.path()
-                    .join("output-library")
-                    .join("Author One/Extracted Title.epub")
-            )
+            Some(PathBuf::from("Author One/Extracted Title.epub"))
         );
+    }
+
+    #[test]
+    fn dry_run_uses_embedded_series_metadata_in_default_planned_path_and_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Series Title</dc:title>
+                <dc:creator>Series Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="series-id">Planned Series</meta>
+                <meta property="collection-type" refines="#series-id">series</meta>
+                <meta property="group-position" refines="#series-id">1</meta>
+              </metadata>
+            </package>"##,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: output_library.clone(),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(PathBuf::from(
+                "Series Author/Planned Series/01 Series Title.epub"
+            ))
+        );
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("Planned Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("1"));
+        let json = serde_json::to_value(metadata).expect("serialize metadata");
+        assert_eq!(json["series"], "Planned Series");
+        assert_eq!(json["series_index"], "1");
+        assert!(report.entries[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn dry_run_includes_series_warnings_in_report_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Conflict Title</dc:title>
+                <dc:creator>Conflict Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="series-id">EPUB Series</meta>
+                <meta property="collection-type" refines="#series-id">series</meta>
+                <meta property="group-position" refines="#series-id">7</meta>
+                <meta name="calibre:series" content="Calibre Series"/>
+                <meta name="calibre:series_index" content="8"/>
+              </metadata>
+            </package>"##,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.entries[0].warnings, vec!["series_conflict"]);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("EPUB Series"));
+        assert_eq!(metadata.series_index.as_deref(), Some("7"));
     }
 
     #[test]
@@ -968,11 +1074,7 @@ mod tests {
         );
         assert_eq!(
             json["entries"][0]["output_path"],
-            temp.path()
-                .join("output-library")
-                .join("Test Author/Report Title.epub")
-                .to_string_lossy()
-                .as_ref()
+            "Test Author/Report Title.epub"
         );
         assert_eq!(json["entries"][0]["action"], "would_copy");
         assert_eq!(json["entries"][0]["metadata"]["title"], "Report Title");
@@ -1047,6 +1149,38 @@ mod tests {
         assert_eq!(
             human_summary(&report),
             "normalize summary: scanned=3 planned=2 copied=0 skipped=1 errored=0"
+        );
+    }
+
+    #[test]
+    fn human_summary_includes_dry_run_output_paths_for_validation() {
+        let report = NormalizeReport {
+            config: ReportConfig {
+                source_library: PathBuf::from("source"),
+                output_library: PathBuf::from("output"),
+                template: "{author}/[{series}/{series_index:02} ]{title}.epub".to_string(),
+                dry_run: true,
+            },
+            totals: Totals {
+                scanned: 1,
+                planned: 1,
+                copied: 0,
+                skipped: 0,
+                errored: 0,
+            },
+            entries: vec![ReportEntry {
+                source_path: PathBuf::from("source/book.epub"),
+                output_path: Some(PathBuf::from("Author/Series/01 Title.epub")),
+                action: EntryAction::WouldCopy,
+                metadata: None,
+                warnings: Vec::new(),
+                error: None,
+            }],
+        };
+
+        assert_eq!(
+            human_summary(&report),
+            "normalize summary: scanned=1 planned=1 copied=0 skipped=0 errored=0\nwould copy: source/book.epub -> Author/Series/01 Title.epub"
         );
     }
 
