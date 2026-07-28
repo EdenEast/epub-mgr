@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EPUB Manager</title>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <h1>EPUB Finder</h1>
+        <p class="hint">Enter a folder path. Results appear as soon as they are found.</p>
+
+        <form id="scan-form" class="scan-form">
+          <input id="path-input" type="text" autocomplete="off" placeholder="/home/user/books" required />
+          <button id="scan-button" type="submit">Scan</button>
+        </form>
+
+        <div id="status" class="status idle">Idle</div>
+      </section>
+
+      <section class="results-panel">
+        <div class="results-header">
+          <h2>EPUB files</h2>
+          <span id="count">0 found</span>
+        </div>
+        <ul id="results" class="results"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
