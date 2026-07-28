@@ -161,6 +161,10 @@ fn render_placeholder(
                 ));
                 (fallback.to_string(), true)
             }
+            None if placeholder.field == Field::Identifier => {
+                warnings.push("missing identifier; rendering empty string".to_string());
+                return Ok(String::new());
+            }
             None => {
                 return Err(PathRenderError::new(format!(
                     "missing required metadata field {} for Output Path Template",
@@ -298,9 +302,8 @@ fn metadata_value<'a>(metadata: &'a NormalizedMetadata, field: Field) -> Option<
 fn fallback_for(field: Field) -> Option<&'static str> {
     match field {
         Field::Title => Some(FALLBACK_TITLE),
-        Field::Author => Some(FALLBACK_AUTHOR),
-        Field::Authors
-        | Field::AuthorSort
+        Field::Author | Field::Authors => Some(FALLBACK_AUTHOR),
+        Field::AuthorSort
         | Field::Series
         | Field::SeriesIndex
         | Field::Language
@@ -446,6 +449,51 @@ mod tests {
             error.to_string(),
             "missing required metadata field series for Output Path Template"
         );
+    }
+
+    #[test]
+    fn missing_authors_outside_optional_section_uses_author_fallback() {
+        let rendered = render_output_path("{authors}/{title}.epub", &NormalizedMetadata::default())
+            .expect("render path");
+
+        assert_eq!(
+            rendered.relative_path,
+            PathBuf::from("Unknown Author/Unknown Title.epub")
+        );
+        assert_eq!(
+            rendered.warnings,
+            vec![
+                "missing authors; using fallback Unknown Author".to_string(),
+                "missing title; using fallback Unknown Title".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_identifier_outside_optional_section_renders_empty_with_warning() {
+        let rendered =
+            render_output_path("{identifier}-{title}.epub", &metadata()).expect("render path");
+
+        assert_eq!(
+            rendered.relative_path,
+            PathBuf::from("-The Fellowship.epub")
+        );
+        assert_eq!(
+            rendered.warnings,
+            vec!["missing identifier; rendering empty string"]
+        );
+    }
+
+    #[test]
+    fn optional_section_with_missing_identifier_disappears_without_warning() {
+        let rendered = render_output_path("{title}/[{identifier}/]copy.epub", &metadata())
+            .expect("render path");
+
+        assert_eq!(
+            rendered.relative_path,
+            PathBuf::from("The Fellowship/copy.epub")
+        );
+        assert!(rendered.warnings.is_empty());
     }
 
     #[test]
