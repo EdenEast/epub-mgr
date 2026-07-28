@@ -1,8 +1,15 @@
-use std::{fmt, fs::File, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fmt,
+    fs::File,
+    io,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::Serialize;
 
 use crate::{
+    copier::{copy_cleaned_epub, CopyOutcome},
     epub_metadata::{read_embedded_metadata, NormalizedMetadata},
     output_path::{render_output_path, NormalizedMetadata as OutputPathMetadata},
 };
@@ -69,9 +76,18 @@ pub struct NormalizeReport {
 #[derive(Debug)]
 pub enum NormalizeError {
     SourceLibraryNotDirectory(PathBuf),
-    RealRunUnsupported,
-    Scan { path: PathBuf, message: String },
-    ReportWrite { path: PathBuf, message: String },
+    OutputLibraryOverlapsSourceLibrary {
+        source_library: PathBuf,
+        output_library: PathBuf,
+    },
+    Scan {
+        path: PathBuf,
+        message: String,
+    },
+    ReportWrite {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -84,9 +100,14 @@ impl fmt::Display for NormalizeError {
                     path.display()
                 )
             }
-            Self::RealRunUnsupported => write!(
+            Self::OutputLibraryOverlapsSourceLibrary {
+                source_library,
+                output_library,
+            } => write!(
                 formatter,
-                "normalize without --dry-run is not supported until copy behavior is implemented"
+                "Output Library must not overlap Source Library for a real normalize run: {} overlaps {}",
+                output_library.display(),
+                source_library.display()
             ),
             Self::Scan { path, message } => {
                 write!(formatter, "failed to scan {}: {message}", path.display())
@@ -105,51 +126,45 @@ impl fmt::Display for NormalizeError {
 impl std::error::Error for NormalizeError {}
 
 pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeError> {
-    if !config.dry_run {
-        return Err(NormalizeError::RealRunUnsupported);
-    }
-
     if !config.source_library.is_dir() {
         return Err(NormalizeError::SourceLibraryNotDirectory(
             config.source_library,
         ));
     }
 
+    if !config.dry_run && output_library_overlaps_source_library(&config) {
+        return Err(NormalizeError::OutputLibraryOverlapsSourceLibrary {
+            source_library: config.source_library,
+            output_library: config.output_library,
+        });
+    }
+
     let source_paths = scan_epub_paths(&config.source_library)?;
+    let mut planned_output_paths = HashSet::new();
     let entries: Vec<ReportEntry> = source_paths
         .into_iter()
-        .map(|source_path| build_dry_run_entry(source_path, &config))
+        .map(|source_path| build_entry(source_path, &config, &mut planned_output_paths))
         .collect();
 
-    let scanned = entries.len();
-    let planned = entries
-        .iter()
-        .filter(|entry| entry.action == EntryAction::WouldCopy)
-        .count();
-    let errored = entries
-        .iter()
-        .filter(|entry| entry.action == EntryAction::Error)
-        .count();
+    let totals = totals_for(&entries);
 
     Ok(NormalizeReport {
         config: ReportConfig {
             source_library: config.source_library,
             output_library: config.output_library,
             template: config.output_path_template,
-            dry_run: true,
+            dry_run: config.dry_run,
         },
-        totals: Totals {
-            scanned,
-            planned,
-            copied: 0,
-            skipped: 0,
-            errored,
-        },
+        totals,
         entries,
     })
 }
 
-fn build_dry_run_entry(source_path: PathBuf, config: &NormalizeConfig) -> ReportEntry {
+fn build_entry(
+    source_path: PathBuf,
+    config: &NormalizeConfig,
+    planned_output_paths: &mut HashSet<PathBuf>,
+) -> ReportEntry {
     let metadata = match read_embedded_metadata(&source_path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -173,14 +188,31 @@ fn build_dry_run_entry(source_path: PathBuf, config: &NormalizeConfig) -> Report
     match render_output_path(&config.output_path_template, &output_path_metadata) {
         Ok(rendered) => {
             warnings.extend(rendered.warnings);
-            ReportEntry {
-                source_path,
-                output_path: Some(config.output_library.join(rendered.relative_path)),
-                action: EntryAction::WouldCopy,
-                metadata: Some(metadata),
-                warnings,
-                error: None,
+            let output_path = config.output_library.join(rendered.relative_path);
+
+            if !planned_output_paths.insert(output_path.clone()) {
+                return skipped_entry(
+                    source_path,
+                    output_path,
+                    metadata,
+                    warnings,
+                    "run_collision",
+                    "multiple source EPUBs render to the same output path",
+                );
             }
+
+            if config.dry_run {
+                return ReportEntry {
+                    source_path,
+                    output_path: Some(output_path),
+                    action: EntryAction::WouldCopy,
+                    metadata: Some(metadata),
+                    warnings,
+                    error: None,
+                };
+            }
+
+            copy_entry(source_path, output_path, metadata, warnings)
         }
         Err(error) => ReportEntry {
             source_path,
@@ -193,6 +225,86 @@ fn build_dry_run_entry(source_path: PathBuf, config: &NormalizeConfig) -> Report
                 message: error.to_string(),
             }),
         },
+    }
+}
+
+fn copy_entry(
+    source_path: PathBuf,
+    output_path: PathBuf,
+    metadata: NormalizedMetadata,
+    warnings: Vec<String>,
+) -> ReportEntry {
+    match copy_cleaned_epub(&source_path, &output_path) {
+        Ok(CopyOutcome::Copied) => ReportEntry {
+            source_path,
+            output_path: Some(output_path),
+            action: EntryAction::Copied,
+            metadata: Some(metadata),
+            warnings,
+            error: None,
+        },
+        Ok(CopyOutcome::OutputExists) => skipped_entry(
+            source_path,
+            output_path,
+            metadata,
+            warnings,
+            "output_exists",
+            "output path already exists",
+        ),
+        Err(error) => ReportEntry {
+            source_path,
+            output_path: Some(output_path),
+            action: EntryAction::Error,
+            metadata: Some(metadata),
+            warnings,
+            error: Some(ReportError {
+                code: "copy_error".to_string(),
+                message: error.to_string(),
+            }),
+        },
+    }
+}
+
+fn skipped_entry(
+    source_path: PathBuf,
+    output_path: PathBuf,
+    metadata: NormalizedMetadata,
+    warnings: Vec<String>,
+    code: &str,
+    message: &str,
+) -> ReportEntry {
+    ReportEntry {
+        source_path,
+        output_path: Some(output_path.clone()),
+        action: EntryAction::Skipped,
+        metadata: Some(metadata),
+        warnings,
+        error: Some(ReportError {
+            code: code.to_string(),
+            message: format!("{message}: {}", output_path.display()),
+        }),
+    }
+}
+
+fn totals_for(entries: &[ReportEntry]) -> Totals {
+    Totals {
+        scanned: entries.len(),
+        planned: entries
+            .iter()
+            .filter(|entry| entry.output_path.is_some() && entry.metadata.is_some())
+            .count(),
+        copied: entries
+            .iter()
+            .filter(|entry| entry.action == EntryAction::Copied)
+            .count(),
+        skipped: entries
+            .iter()
+            .filter(|entry| entry.action == EntryAction::Skipped)
+            .count(),
+        errored: entries
+            .iter()
+            .filter(|entry| entry.action == EntryAction::Error)
+            .count(),
     }
 }
 
@@ -212,6 +324,59 @@ fn output_path_metadata(metadata: &NormalizedMetadata) -> OutputPathMetadata {
             .or_else(|| metadata.identifiers.first())
             .map(|identifier| identifier.value.clone()),
     }
+}
+
+fn output_library_overlaps_source_library(config: &NormalizeConfig) -> bool {
+    let Ok(source_library) = config.source_library.canonicalize() else {
+        return false;
+    };
+    let Ok(output_library) = canonicalize_existing_or_intended_path(&config.output_library) else {
+        return false;
+    };
+
+    output_library.starts_with(&source_library) || source_library.starts_with(&output_library)
+}
+
+fn canonicalize_existing_or_intended_path(path: &Path) -> io::Result<PathBuf> {
+    canonicalize_existing_or_intended_path_inner(&normalize_path_lexically(path)?)
+}
+
+fn canonicalize_existing_or_intended_path_inner(path: &Path) -> io::Result<PathBuf> {
+    if path.try_exists()? {
+        return path.canonicalize();
+    }
+
+    let Some(parent) = path.parent() else {
+        return Ok(path.to_path_buf());
+    };
+    let Some(file_name) = path.file_name() else {
+        return Ok(path.to_path_buf());
+    };
+
+    Ok(canonicalize_existing_or_intended_path_inner(parent)?.join(file_name))
+}
+
+fn normalize_path_lexically(path: &Path) -> io::Result<PathBuf> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+
+    for component in absolute_path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    Ok(normalized)
 }
 
 pub fn scan_epub_paths(source_library: &std::path::Path) -> Result<Vec<PathBuf>, NormalizeError> {
@@ -318,6 +483,44 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_reports_run_collisions_without_creating_output_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("first.epub"),
+            complete_opf("Same Book"),
+        );
+        write_epub_with_opf(
+            &source_library.join("second.epub"),
+            complete_opf("Same Book"),
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: output_library.clone(),
+            output_path_template: "{author}/{title}.epub".to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert!(
+            !output_library.exists(),
+            "dry-run must not create Output Library"
+        );
+        assert_eq!(report.entries[0].action, EntryAction::WouldCopy);
+        assert_eq!(report.entries[1].action, EntryAction::Skipped);
+        assert_eq!(
+            report.entries[1]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("run_collision")
+        );
+    }
+
+    #[test]
     fn source_library_must_be_a_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("missing");
@@ -337,18 +540,217 @@ mod tests {
     }
 
     #[test]
-    fn real_run_returns_unsupported_error() {
+    fn real_run_copies_cleaned_epub_byte_for_byte_and_creates_parent_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        let source_path = source_library.join("book.epub");
+        let output_path = output_library.join("Test Author/Copied Book.epub");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_path, complete_opf("Copied Book"));
+        let original_bytes = fs::read(&source_path).expect("read source EPUB");
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: output_library.clone(),
+            output_path_template: "{author}/{title}.epub".to_string(),
+            dry_run: false,
+        })
+        .expect("real-run report");
+
+        assert_eq!(
+            fs::read(&output_path).expect("read Cleaned EPUB"),
+            original_bytes
+        );
+        assert!(
+            output_path.parent().expect("parent").is_dir(),
+            "real run must create parent directories for Cleaned EPUBs"
+        );
+        assert_eq!(report.config.dry_run, false);
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.copied, 1);
+        assert_eq!(report.totals.skipped, 0);
+        assert_eq!(report.totals.errored, 0);
+        assert_eq!(report.entries[0].action, EntryAction::Copied);
+        assert_eq!(report.entries[0].output_path, Some(output_path));
+        assert!(report.entries[0].error.is_none());
+    }
+
+    #[test]
+    fn real_run_skips_existing_output_without_overwriting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        let output_path = output_library.join("Test Author/Existing Book.epub");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        fs::create_dir_all(output_path.parent().expect("parent")).expect("create output parent");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            complete_opf("Existing Book"),
+        );
+        fs::write(&output_path, b"existing output must survive").expect("write existing output");
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library,
+            output_path_template: "{author}/{title}.epub".to_string(),
+            dry_run: false,
+        })
+        .expect("real-run report");
+
+        assert_eq!(
+            fs::read(&output_path).expect("read existing output"),
+            b"existing output must survive"
+        );
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.copied, 0);
+        assert_eq!(report.totals.skipped, 1);
+        assert_eq!(report.totals.errored, 0);
+        assert_eq!(report.entries[0].action, EntryAction::Skipped);
+        let error = report.entries[0].error.as_ref().expect("skip error");
+        assert_eq!(error.code, "output_exists");
+    }
+
+    #[test]
+    fn real_run_report_distinguishes_copied_skipped_and_errored_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        let existing_output = output_library.join("Test Author/Existing Book.epub");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        fs::create_dir_all(existing_output.parent().expect("parent"))
+            .expect("create output parent");
+        write_epub_with_opf(
+            &source_library.join("copy.epub"),
+            complete_opf("Copied Book"),
+        );
+        write_epub_with_opf(
+            &source_library.join("existing.epub"),
+            complete_opf("Existing Book"),
+        );
+        write_epub_with_opf(
+            &source_library.join("malformed.epub"),
+            "<package><metadata><dc:title>Broken",
+        );
+        fs::write(&existing_output, b"already here").expect("write existing output");
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library,
+            output_path_template: "{author}/{title}.epub".to_string(),
+            dry_run: false,
+        })
+        .expect("real-run report should include per-file errors");
+
+        assert_eq!(report.totals.scanned, 3);
+        assert_eq!(report.totals.planned, 2);
+        assert_eq!(report.totals.copied, 1);
+        assert_eq!(report.totals.skipped, 1);
+        assert_eq!(report.totals.errored, 1);
+        assert_eq!(report.entries[0].action, EntryAction::Copied);
+        assert_eq!(report.entries[1].action, EntryAction::Skipped);
+        assert_eq!(
+            report.entries[1]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("output_exists")
+        );
+        assert_eq!(report.entries[2].action, EntryAction::Error);
+        assert_eq!(
+            report.entries[2]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("malformed_package_document")
+        );
+    }
+
+    #[test]
+    fn real_run_rejects_overlapping_output_library_to_protect_source_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = source_library.join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
 
         let error = normalize(NormalizeConfig {
-            source_library: temp.path().to_path_buf(),
-            output_library: temp.path().join("output"),
+            source_library: source_library.clone(),
+            output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: false,
         })
-        .expect_err("real run should be unsupported for this tracer bullet");
+        .expect_err("real run must not modify Source Library");
 
-        assert!(matches!(error, NormalizeError::RealRunUnsupported));
+        assert!(matches!(
+            error,
+            NormalizeError::OutputLibraryOverlapsSourceLibrary {
+                source_library: reported_source,
+                output_library: reported_output,
+            } if reported_source == source_library && reported_output == output_library
+        ));
+        assert!(
+            !output_library.exists(),
+            "rejected real run must not create Output Library inside Source Library"
+        );
+    }
+
+    #[test]
+    fn real_run_rejects_output_library_that_contains_source_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output_library = temp.path().join("output-library");
+        let source_library = output_library.join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
+
+        let error = normalize(NormalizeConfig {
+            source_library: source_library.clone(),
+            output_library: output_library.clone(),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: false,
+        })
+        .expect_err("real run must reject overlapping libraries");
+
+        assert!(matches!(
+            error,
+            NormalizeError::OutputLibraryOverlapsSourceLibrary {
+                source_library: reported_source,
+                output_library: reported_output,
+            } if reported_source == source_library && reported_output == output_library
+        ));
+    }
+
+    #[test]
+    fn real_run_rejects_parent_components_that_would_place_output_library_inside_source_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp
+            .path()
+            .join("missing-parent")
+            .join("..")
+            .join("source-library")
+            .join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
+
+        let error = normalize(NormalizeConfig {
+            source_library: source_library.clone(),
+            output_library: output_library.clone(),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: false,
+        })
+        .expect_err("real run must reject normalized overlap");
+
+        assert!(matches!(
+            error,
+            NormalizeError::OutputLibraryOverlapsSourceLibrary { .. }
+        ));
+        assert!(
+            !source_library.join("output-library").exists(),
+            "rejected real run must not create Output Library through parent components"
+        );
     }
 
     #[test]
