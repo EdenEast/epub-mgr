@@ -3,6 +3,9 @@ use std::{path::PathBuf, thread};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+pub mod cli;
+pub mod normalize;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EpubFoundPayload {
@@ -38,7 +41,7 @@ fn scan_epubs(app: AppHandle, path: String, scan_id: String) -> Result<(), Strin
         for entry in jwalk::WalkDir::new(root).follow_links(false) {
             match entry {
                 Ok(entry) => {
-                    if !entry.file_type().is_file() || !is_epub(&entry.path()) {
+                    if !entry.file_type().is_file() || !normalize::is_epub(&entry.path()) {
                         continue;
                     }
 
@@ -67,12 +70,6 @@ fn scan_epubs(app: AppHandle, path: String, scan_id: String) -> Result<(), Strin
     });
 
     Ok(())
-}
-
-fn is_epub(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
