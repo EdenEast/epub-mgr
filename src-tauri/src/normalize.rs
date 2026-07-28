@@ -2,7 +2,10 @@ use std::{fmt, fs::File, path::PathBuf};
 
 use serde::Serialize;
 
-use crate::epub_metadata::{read_embedded_metadata, NormalizedMetadata};
+use crate::{
+    epub_metadata::{read_embedded_metadata, NormalizedMetadata},
+    output_path::{render_output_path, NormalizedMetadata as OutputPathMetadata},
+};
 
 pub const DEFAULT_OUTPUT_PATH_TEMPLATE: &str = "{author}/[{series}/{series_index:02} ]{title}.epub";
 
@@ -113,14 +116,20 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     }
 
     let source_paths = scan_epub_paths(&config.source_library)?;
-    let entries: Vec<ReportEntry> = source_paths.into_iter().map(build_dry_run_entry).collect();
+    let entries: Vec<ReportEntry> = source_paths
+        .into_iter()
+        .map(|source_path| build_dry_run_entry(source_path, &config))
+        .collect();
 
     let scanned = entries.len();
+    let planned = entries
+        .iter()
+        .filter(|entry| entry.action == EntryAction::WouldCopy)
+        .count();
     let errored = entries
         .iter()
         .filter(|entry| entry.action == EntryAction::Error)
         .count();
-    let planned = scanned - errored;
 
     Ok(NormalizeReport {
         config: ReportConfig {
@@ -140,27 +149,68 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     })
 }
 
-fn build_dry_run_entry(source_path: PathBuf) -> ReportEntry {
-    match read_embedded_metadata(&source_path) {
-        Ok(metadata) => ReportEntry {
-            source_path,
-            output_path: None,
-            action: EntryAction::WouldCopy,
-            warnings: metadata.missing_required_warnings(),
-            metadata: Some(metadata),
-            error: None,
-        },
+fn build_dry_run_entry(source_path: PathBuf, config: &NormalizeConfig) -> ReportEntry {
+    let metadata = match read_embedded_metadata(&source_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return ReportEntry {
+                source_path,
+                output_path: None,
+                action: EntryAction::Error,
+                metadata: None,
+                warnings: Vec::new(),
+                error: Some(ReportError {
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+    };
+
+    let mut warnings = metadata.missing_required_warnings();
+    let output_path_metadata = output_path_metadata(&metadata);
+
+    match render_output_path(&config.output_path_template, &output_path_metadata) {
+        Ok(rendered) => {
+            warnings.extend(rendered.warnings);
+            ReportEntry {
+                source_path,
+                output_path: Some(config.output_library.join(rendered.relative_path)),
+                action: EntryAction::WouldCopy,
+                metadata: Some(metadata),
+                warnings,
+                error: None,
+            }
+        }
         Err(error) => ReportEntry {
             source_path,
             output_path: None,
             action: EntryAction::Error,
-            metadata: None,
-            warnings: Vec::new(),
+            metadata: Some(metadata),
+            warnings,
             error: Some(ReportError {
-                code: error.code().to_string(),
+                code: "path_render_error".to_string(),
                 message: error.to_string(),
             }),
         },
+    }
+}
+
+fn output_path_metadata(metadata: &NormalizedMetadata) -> OutputPathMetadata {
+    OutputPathMetadata {
+        title: metadata.title.clone(),
+        author: metadata.authors.first().cloned(),
+        authors: (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
+        author_sort: metadata.authors.first().cloned(),
+        series: None,
+        series_index: None,
+        language: metadata.language.clone(),
+        identifier: metadata
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.is_unique)
+            .or_else(|| metadata.identifiers.first())
+            .map(|identifier| identifier.value.clone()),
     }
 }
 
@@ -253,7 +303,7 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.action == EntryAction::WouldCopy
-                && entry.output_path.is_none()
+                && entry.output_path.is_some()
                 && entry.metadata.is_some()
                 && entry.warnings.is_empty()
                 && entry.error.is_none()));
@@ -265,6 +315,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![source_library.join("book.epub"), nested.join("other.EPUB")]
         );
+    }
+
+    #[test]
+    fn source_library_must_be_a_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing");
+
+        let error = normalize(NormalizeConfig {
+            source_library: missing.clone(),
+            output_library: temp.path().join("output"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect_err("missing Source Library should fail");
+
+        assert!(matches!(
+            error,
+            NormalizeError::SourceLibraryNotDirectory(path) if path == missing
+        ));
+    }
+
+    #[test]
+    fn real_run_returns_unsupported_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let error = normalize(NormalizeConfig {
+            source_library: temp.path().to_path_buf(),
+            output_library: temp.path().join("output"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: false,
+        })
+        .expect_err("real run should be unsupported for this tracer bullet");
+
+        assert!(matches!(error, NormalizeError::RealRunUnsupported));
     }
 
     #[test]
@@ -304,6 +388,14 @@ mod tests {
         assert_eq!(metadata.language.as_deref(), Some("en-US"));
         assert_eq!(metadata.identifiers.len(), 2);
         assert!(metadata.identifiers[0].is_unique);
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(
+                temp.path()
+                    .join("output-library")
+                    .join("Author One/Extracted Title.epub")
+            )
+        );
     }
 
     #[test]
@@ -333,7 +425,13 @@ mod tests {
         assert_eq!(report.entries[0].action, EntryAction::WouldCopy);
         assert_eq!(
             report.entries[0].warnings,
-            vec!["missing_title", "missing_author", "missing_language"]
+            vec![
+                "missing_title",
+                "missing_author",
+                "missing_language",
+                "missing author; using fallback Unknown Author",
+                "missing title; using fallback Unknown Title"
+            ]
         );
     }
 
@@ -371,7 +469,13 @@ mod tests {
         assert_eq!(metadata.identifiers, Vec::new());
         assert_eq!(
             report.entries[0].warnings,
-            vec!["missing_title", "missing_author", "missing_language"]
+            vec![
+                "missing_title",
+                "missing_author",
+                "missing_language",
+                "missing author; using fallback Unknown Author",
+                "missing title; using fallback Unknown Title"
+            ]
         );
     }
 
@@ -460,7 +564,14 @@ mod tests {
             json["entries"][0]["source_path"],
             source_library.join("book.epub").to_string_lossy().as_ref()
         );
-        assert_eq!(json["entries"][0]["output_path"], serde_json::Value::Null);
+        assert_eq!(
+            json["entries"][0]["output_path"],
+            temp.path()
+                .join("output-library")
+                .join("Test Author/Report Title.epub")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert_eq!(json["entries"][0]["action"], "would_copy");
         assert_eq!(json["entries"][0]["metadata"]["title"], "Report Title");
         assert_eq!(
@@ -470,6 +581,46 @@ mod tests {
         assert_eq!(json["entries"][0]["metadata"]["language"], "en");
         assert_eq!(json["entries"][0]["warnings"], serde_json::json!([]));
         assert_eq!(json["entries"][0]["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn dry_run_reports_path_render_errors_per_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
+
+        let report = normalize(NormalizeConfig {
+            source_library: source_library.clone(),
+            output_library: temp.path().join("output-library"),
+            output_path_template: "{series}/{title}.epub".to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 0);
+        assert_eq!(report.totals.errored, 1);
+        assert_eq!(
+            report.entries[0].source_path,
+            source_library.join("book.epub")
+        );
+        assert_eq!(report.entries[0].output_path, None);
+        assert_eq!(report.entries[0].action, EntryAction::Error);
+        assert_eq!(
+            report.entries[0]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("path_render_error")
+        );
+        assert_eq!(
+            report.entries[0]
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("missing required metadata field series for Output Path Template")
+        );
     }
 
     #[test]

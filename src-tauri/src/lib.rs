@@ -6,6 +6,7 @@ use tauri::{AppHandle, Emitter};
 pub mod cli;
 pub mod epub_metadata;
 pub mod normalize;
+pub mod output_path;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
