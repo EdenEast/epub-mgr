@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_real_run_args_so_core_can_return_clear_unsupported_error() {
+    fn accepts_real_run_args() {
         let cli = Cli::try_parse_from([
             "epub-mgr",
             "normalize",

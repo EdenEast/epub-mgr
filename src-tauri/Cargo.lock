@@ -871,6 +871,7 @@ dependencies = [
  "clap",
  "jwalk",
  "quick-xml",
+ "rustix",
  "serde",
  "serde_json",
  "tauri",
