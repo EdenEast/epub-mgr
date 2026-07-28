@@ -2,6 +2,8 @@ use std::{fmt, fs::File, path::PathBuf};
 
 use serde::Serialize;
 
+use crate::output_path::{render_output_path, NormalizedMetadata};
+
 pub const DEFAULT_OUTPUT_PATH_TEMPLATE: &str = "{author}/[{series}/{series_index:02} ]{title}.epub";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,16 +108,18 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     let source_paths = scan_epub_paths(&config.source_library)?;
     let entries: Vec<ReportEntry> = source_paths
         .into_iter()
-        .map(|source_path| ReportEntry {
-            source_path,
-            output_path: None,
-            action: EntryAction::WouldCopy,
-            warnings: Vec::new(),
-            error: None,
-        })
+        .map(|source_path| render_report_entry(source_path, &config))
         .collect();
 
     let scanned = entries.len();
+    let planned = entries
+        .iter()
+        .filter(|entry| entry.action == EntryAction::WouldCopy)
+        .count();
+    let errored = entries
+        .iter()
+        .filter(|entry| entry.action == EntryAction::Error)
+        .count();
 
     Ok(NormalizeReport {
         config: ReportConfig {
@@ -126,13 +130,37 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
         },
         totals: Totals {
             scanned,
-            planned: scanned,
+            planned,
             copied: 0,
             skipped: 0,
-            errored: 0,
+            errored,
         },
         entries,
     })
+}
+
+fn render_report_entry(source_path: PathBuf, config: &NormalizeConfig) -> ReportEntry {
+    // Real EPUB metadata extraction lands in #10. Until then, render through the
+    // same seam with empty normalized metadata so fallback and error behavior is
+    // visible in dry-run reports.
+    let metadata = NormalizedMetadata::default();
+
+    match render_output_path(&config.output_path_template, &metadata) {
+        Ok(rendered) => ReportEntry {
+            source_path,
+            output_path: Some(config.output_library.join(rendered.relative_path)),
+            action: EntryAction::WouldCopy,
+            warnings: rendered.warnings,
+            error: None,
+        },
+        Err(error) => ReportEntry {
+            source_path,
+            output_path: None,
+            action: EntryAction::Error,
+            warnings: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 pub fn scan_epub_paths(source_library: &std::path::Path) -> Result<Vec<PathBuf>, NormalizeError> {
@@ -223,8 +251,13 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.action == EntryAction::WouldCopy
-                && entry.output_path.is_none()
-                && entry.warnings.is_empty()
+                && entry.output_path
+                    == Some(output_library.join("Unknown Author/Unknown Title.epub"))
+                && entry.warnings
+                    == vec![
+                        "missing author; using fallback Unknown Author".to_string(),
+                        "missing title; using fallback Unknown Title".to_string()
+                    ]
                 && entry.error.is_none()));
         assert_eq!(
             report
@@ -302,10 +335,53 @@ mod tests {
             json["entries"][0]["source_path"],
             source_library.join("book.epub").to_string_lossy().as_ref()
         );
-        assert_eq!(json["entries"][0]["output_path"], serde_json::Value::Null);
+        assert_eq!(
+            json["entries"][0]["output_path"],
+            temp.path()
+                .join("output-library")
+                .join("Unknown Author/Unknown Title.epub")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert_eq!(json["entries"][0]["action"], "would_copy");
-        assert_eq!(json["entries"][0]["warnings"], serde_json::json!([]));
+        assert_eq!(
+            json["entries"][0]["warnings"],
+            serde_json::json!([
+                "missing author; using fallback Unknown Author",
+                "missing title; using fallback Unknown Title"
+            ])
+        );
         assert_eq!(json["entries"][0]["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn dry_run_reports_path_render_errors_per_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        fs::write(source_library.join("book.epub"), b"epub").expect("write epub");
+
+        let report = normalize(NormalizeConfig {
+            source_library: source_library.clone(),
+            output_library: temp.path().join("output-library"),
+            output_path_template: "{series}/{title}.epub".to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 0);
+        assert_eq!(report.totals.errored, 1);
+        assert_eq!(
+            report.entries[0].source_path,
+            source_library.join("book.epub")
+        );
+        assert_eq!(report.entries[0].output_path, None);
+        assert_eq!(report.entries[0].action, EntryAction::Error);
+        assert_eq!(
+            report.entries[0].error.as_deref(),
+            Some("missing required metadata field series for Output Path Template")
+        );
     }
 
     #[test]
