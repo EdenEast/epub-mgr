@@ -2,7 +2,10 @@ use std::{fmt, fs::File, path::PathBuf};
 
 use serde::Serialize;
 
-use crate::output_path::{render_output_path, NormalizedMetadata};
+use crate::{
+    epub_metadata::{read_embedded_metadata, NormalizedMetadata},
+    output_path::{render_output_path, NormalizedMetadata as OutputPathMetadata},
+};
 
 pub const DEFAULT_OUTPUT_PATH_TEMPLATE: &str = "{author}/[{series}/{series_index:02} ]{title}.epub";
 
@@ -36,8 +39,15 @@ pub struct ReportEntry {
     pub source_path: PathBuf,
     pub output_path: Option<PathBuf>,
     pub action: EntryAction,
+    pub metadata: Option<NormalizedMetadata>,
     pub warnings: Vec<String>,
-    pub error: Option<String>,
+    pub error: Option<ReportError>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReportError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -108,7 +118,7 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     let source_paths = scan_epub_paths(&config.source_library)?;
     let entries: Vec<ReportEntry> = source_paths
         .into_iter()
-        .map(|source_path| render_report_entry(source_path, &config))
+        .map(|source_path| build_dry_run_entry(source_path, &config))
         .collect();
 
     let scanned = entries.len();
@@ -139,27 +149,68 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     })
 }
 
-fn render_report_entry(source_path: PathBuf, config: &NormalizeConfig) -> ReportEntry {
-    // Real EPUB metadata extraction lands in #10. Until then, render through the
-    // same seam with empty normalized metadata so fallback and error behavior is
-    // visible in dry-run reports.
-    let metadata = NormalizedMetadata::default();
+fn build_dry_run_entry(source_path: PathBuf, config: &NormalizeConfig) -> ReportEntry {
+    let metadata = match read_embedded_metadata(&source_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return ReportEntry {
+                source_path,
+                output_path: None,
+                action: EntryAction::Error,
+                metadata: None,
+                warnings: Vec::new(),
+                error: Some(ReportError {
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+    };
 
-    match render_output_path(&config.output_path_template, &metadata) {
-        Ok(rendered) => ReportEntry {
-            source_path,
-            output_path: Some(config.output_library.join(rendered.relative_path)),
-            action: EntryAction::WouldCopy,
-            warnings: rendered.warnings,
-            error: None,
-        },
+    let mut warnings = metadata.missing_required_warnings();
+    let output_path_metadata = output_path_metadata(&metadata);
+
+    match render_output_path(&config.output_path_template, &output_path_metadata) {
+        Ok(rendered) => {
+            warnings.extend(rendered.warnings);
+            ReportEntry {
+                source_path,
+                output_path: Some(config.output_library.join(rendered.relative_path)),
+                action: EntryAction::WouldCopy,
+                metadata: Some(metadata),
+                warnings,
+                error: None,
+            }
+        }
         Err(error) => ReportEntry {
             source_path,
             output_path: None,
             action: EntryAction::Error,
-            warnings: Vec::new(),
-            error: Some(error.to_string()),
+            metadata: Some(metadata),
+            warnings,
+            error: Some(ReportError {
+                code: "path_render_error".to_string(),
+                message: error.to_string(),
+            }),
         },
+    }
+}
+
+fn output_path_metadata(metadata: &NormalizedMetadata) -> OutputPathMetadata {
+    OutputPathMetadata {
+        title: metadata.title.clone(),
+        author: metadata.authors.first().cloned(),
+        authors: (!metadata.authors.is_empty()).then(|| metadata.authors.join(", ")),
+        author_sort: metadata.authors.first().cloned(),
+        series: None,
+        series_index: None,
+        language: metadata.language.clone(),
+        identifier: metadata
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.is_unique)
+            .or_else(|| metadata.identifiers.first())
+            .map(|identifier| identifier.value.clone()),
     }
 }
 
@@ -216,7 +267,8 @@ pub fn write_json_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, io::Write, path::Path};
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
     #[test]
     fn dry_run_scans_nested_epubs_without_creating_output_library() {
@@ -225,8 +277,8 @@ mod tests {
         let nested = source_library.join("nested");
         let output_library = temp.path().join("output-library");
         fs::create_dir_all(&nested).expect("create nested Source Library");
-        fs::write(source_library.join("book.epub"), b"epub").expect("write epub");
-        fs::write(nested.join("other.EPUB"), b"epub").expect("write nested epub");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book One"));
+        write_epub_with_opf(&nested.join("other.EPUB"), complete_opf("Book Two"));
         fs::write(nested.join("notes.txt"), b"not epub").expect("write ignored file");
 
         let report = normalize(NormalizeConfig {
@@ -251,13 +303,9 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.action == EntryAction::WouldCopy
-                && entry.output_path
-                    == Some(output_library.join("Unknown Author/Unknown Title.epub"))
-                && entry.warnings
-                    == vec![
-                        "missing author; using fallback Unknown Author".to_string(),
-                        "missing title; using fallback Unknown Title".to_string()
-                    ]
+                && entry.output_path.is_some()
+                && entry.metadata.is_some()
+                && entry.warnings.is_empty()
                 && entry.error.is_none()));
         assert_eq!(
             report
@@ -304,12 +352,193 @@ mod tests {
     }
 
     #[test]
-    fn writes_json_report_with_config_totals_and_entries() {
+    fn dry_run_extracts_embedded_package_metadata_into_report_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/" unique-identifier="book-id">
+              <metadata>
+                <dc:title>Extracted Title</dc:title>
+                <dc:creator opf:role="aut">Author One</dc:creator>
+                <dc:creator opf:role="edt">Editor One</dc:creator>
+                <dc:creator>Author Two</dc:creator>
+                <dc:language>en-US</dc:language>
+                <dc:identifier id="book-id" opf:scheme="uuid">urn:uuid:abc</dc:identifier>
+                <dc:identifier>isbn:9780000000000</dc:identifier>
+              </metadata>
+            </package>"##,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.title.as_deref(), Some("Extracted Title"));
+        assert_eq!(metadata.authors, vec!["Author One", "Author Two"]);
+        assert_eq!(metadata.language.as_deref(), Some("en-US"));
+        assert_eq!(metadata.identifiers.len(), 2);
+        assert!(metadata.identifiers[0].is_unique);
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(
+                temp.path()
+                    .join("output-library")
+                    .join("Author One/Extracted Title.epub")
+            )
+        );
+    }
+
+    #[test]
+    fn dry_run_warns_when_required_metadata_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:identifier>urn:uuid:missing</dc:identifier>
+              </metadata>
+            </package>"#,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        assert_eq!(report.entries[0].action, EntryAction::WouldCopy);
+        assert_eq!(
+            report.entries[0].warnings,
+            vec![
+                "missing_title",
+                "missing_author",
+                "missing_language",
+                "missing author; using fallback Unknown Author",
+                "missing title; using fallback Unknown Title"
+            ]
+        );
+    }
+
+    #[test]
+    fn dry_run_warns_when_only_non_dublin_core_metadata_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r#"<package xmlns:custom="urn:not-dc">
+              <metadata>
+                <custom:title>Wrong Title</custom:title>
+                <custom:creator>Wrong Author</custom:creator>
+                <custom:language>xx</custom:language>
+                <custom:identifier>wrong-id</custom:identifier>
+              </metadata>
+            </package>"#,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.authors, Vec::<String>::new());
+        assert_eq!(metadata.language, None);
+        assert_eq!(metadata.identifiers, Vec::new());
+        assert_eq!(
+            report.entries[0].warnings,
+            vec![
+                "missing_title",
+                "missing_author",
+                "missing_language",
+                "missing author; using fallback Unknown Author",
+                "missing title; using fallback Unknown Title"
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_epub_metadata_is_reported_per_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            "<package><metadata><dc:title>Broken",
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report should continue");
+
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 0);
+        assert_eq!(report.totals.errored, 1);
+        assert_eq!(report.entries[0].action, EntryAction::Error);
+        assert_eq!(report.entries[0].metadata, None);
+        let error = report.entries[0].error.as_ref().expect("entry error");
+        assert_eq!(error.code, "malformed_package_document");
+    }
+
+    #[test]
+    fn unreadable_epub_is_reported_per_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        fs::write(source_library.join("book.epub"), b"not a zip").expect("write invalid EPUB");
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report should continue");
+
+        assert_eq!(report.totals.scanned, 1);
+        assert_eq!(report.totals.planned, 0);
+        assert_eq!(report.totals.errored, 1);
+        assert_eq!(report.entries[0].action, EntryAction::Error);
+        let error = report.entries[0].error.as_ref().expect("entry error");
+        assert_eq!(error.code, "unreadable_epub");
+    }
+
+    #[test]
+    fn writes_json_report_with_config_totals_entries_and_metadata() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_library = temp.path().join("source-library");
         let report_path = temp.path().join("report.json");
         fs::create_dir_all(&source_library).expect("create Source Library");
-        fs::write(source_library.join("book.epub"), b"epub").expect("write epub");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            complete_opf("Report Title"),
+        );
 
         let report = normalize(NormalizeConfig {
             source_library: source_library.clone(),
@@ -339,18 +568,18 @@ mod tests {
             json["entries"][0]["output_path"],
             temp.path()
                 .join("output-library")
-                .join("Unknown Author/Unknown Title.epub")
+                .join("Test Author/Report Title.epub")
                 .to_string_lossy()
                 .as_ref()
         );
         assert_eq!(json["entries"][0]["action"], "would_copy");
+        assert_eq!(json["entries"][0]["metadata"]["title"], "Report Title");
         assert_eq!(
-            json["entries"][0]["warnings"],
-            serde_json::json!([
-                "missing author; using fallback Unknown Author",
-                "missing title; using fallback Unknown Title"
-            ])
+            json["entries"][0]["metadata"]["authors"],
+            serde_json::json!(["Test Author"])
         );
+        assert_eq!(json["entries"][0]["metadata"]["language"], "en");
+        assert_eq!(json["entries"][0]["warnings"], serde_json::json!([]));
         assert_eq!(json["entries"][0]["error"], serde_json::Value::Null);
     }
 
@@ -359,7 +588,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_library = temp.path().join("source-library");
         fs::create_dir_all(&source_library).expect("create Source Library");
-        fs::write(source_library.join("book.epub"), b"epub").expect("write epub");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
 
         let report = normalize(NormalizeConfig {
             source_library: source_library.clone(),
@@ -379,7 +608,17 @@ mod tests {
         assert_eq!(report.entries[0].output_path, None);
         assert_eq!(report.entries[0].action, EntryAction::Error);
         assert_eq!(
-            report.entries[0].error.as_deref(),
+            report.entries[0]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("path_render_error")
+        );
+        assert_eq!(
+            report.entries[0]
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
             Some("missing required metadata field series for Output Path Template")
         );
     }
@@ -407,5 +646,40 @@ mod tests {
             human_summary(&report),
             "normalize summary: scanned=3 planned=2 copied=0 skipped=1 errored=0"
         );
+    }
+
+    fn complete_opf(title: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>{title}</dc:title>
+                <dc:creator>Test Author</dc:creator>
+                <dc:language>en</dc:language>
+              </metadata>
+            </package>"#
+        )
+    }
+
+    fn write_epub_with_opf(path: &Path, opf: impl AsRef<str>) {
+        let file = fs::File::create(path).expect("create EPUB");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+        zip.start_file("META-INF/container.xml", options)
+            .expect("start container");
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+            <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+              <rootfiles>
+                <rootfile full-path="OPS/content.opf" media-type="application/oebps-package+xml"/>
+              </rootfiles>
+            </container>"#,
+        )
+        .expect("write container");
+        zip.start_file("OPS/content.opf", options)
+            .expect("start OPF");
+        zip.write_all(opf.as_ref().as_bytes()).expect("write OPF");
+        zip.finish().expect("finish EPUB");
     }
 }
