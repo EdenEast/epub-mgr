@@ -338,6 +338,44 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_warns_when_only_non_dublin_core_metadata_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            r#"<package xmlns:custom="urn:not-dc">
+              <metadata>
+                <custom:title>Wrong Title</custom:title>
+                <custom:creator>Wrong Author</custom:creator>
+                <custom:language>xx</custom:language>
+                <custom:identifier>wrong-id</custom:identifier>
+              </metadata>
+            </package>"#,
+        );
+
+        let report = normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report");
+
+        assert_eq!(report.totals.planned, 1);
+        assert_eq!(report.totals.errored, 0);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.authors, Vec::<String>::new());
+        assert_eq!(metadata.language, None);
+        assert_eq!(metadata.identifiers, Vec::new());
+        assert_eq!(
+            report.entries[0].warnings,
+            vec!["missing_title", "missing_author", "missing_language"]
+        );
+    }
+
+    #[test]
     fn malformed_epub_metadata_is_reported_per_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_library = temp.path().join("source-library");

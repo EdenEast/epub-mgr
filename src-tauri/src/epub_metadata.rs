@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, fs::File, io::Read, path::Path};
+use std::{collections::HashMap, fmt, fs::File, io::Read, path::Path, str};
 
 use quick_xml::{
     escape::unescape,
@@ -7,6 +7,8 @@ use quick_xml::{
 };
 use serde::Serialize;
 use zip::ZipArchive;
+
+const DUBLIN_CORE_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct NormalizedMetadata {
@@ -175,6 +177,7 @@ fn parse_package_metadata(
     let mut reader = Reader::from_str(package_xml);
     reader.config_mut().trim_text(true);
 
+    let mut namespaces = NamespaceContext::default();
     let mut unique_identifier_id = None;
     let mut in_metadata = false;
     let mut metadata_depth = 0usize;
@@ -185,6 +188,9 @@ fn parse_package_metadata(
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
+                namespaces
+                    .push_from_element(&reader, &element)
+                    .map_err(|message| package_xml_error(package_path, message))?;
                 let name = element.name();
                 let element_name = local_name(name.as_ref());
 
@@ -196,8 +202,9 @@ fn parse_package_metadata(
                     metadata_depth = 1;
                 } else if in_metadata {
                     metadata_depth += 1;
-                    if let Some(target) = text_target_from_element(&reader, &element, element_name)
-                        .map_err(|message| package_xml_error(package_path, message))?
+                    if let Some(target) =
+                        text_target_from_element(&reader, &element, &namespaces)
+                            .map_err(|message| package_xml_error(package_path, message))?
                     {
                         current = Some(target);
                     } else if element_name == b"meta" {
@@ -258,6 +265,8 @@ fn parse_package_metadata(
                         metadata_depth -= 1;
                     }
                 }
+
+                namespaces.pop();
             }
             Ok(Event::Eof) => {
                 if in_metadata || current.is_some() || current_role_refinement.is_some() {
@@ -299,8 +308,13 @@ fn append_text(
 fn text_target_from_element(
     reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
-    element_name: &[u8],
+    namespaces: &NamespaceContext,
 ) -> Result<Option<TextTarget>, String> {
+    let name = element.name();
+    let Some(element_name) = dublin_core_local_name(name.as_ref(), namespaces) else {
+        return Ok(None);
+    };
+
     match element_name {
         b"title" => Ok(Some(TextTarget::new(TextKind::Title))),
         b"language" => Ok(Some(TextTarget::new(TextKind::Language))),
@@ -364,6 +378,102 @@ fn local_name(name: &[u8]) -> &[u8] {
     name.rsplit(|byte| *byte == b':' || *byte == b'}')
         .next()
         .unwrap_or(name)
+}
+
+#[derive(Default)]
+struct NamespaceContext {
+    stack: Vec<HashMap<String, String>>,
+}
+
+impl NamespaceContext {
+    fn push_from_element(
+        &mut self,
+        reader: &Reader<&[u8]>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), String> {
+        let mut namespaces = self.stack.last().cloned().unwrap_or_default();
+        apply_namespace_declarations(reader, element, &mut namespaces)?;
+        self.stack.push(namespaces);
+        Ok(())
+    }
+
+    fn pop(&mut self) {
+        self.stack.pop();
+    }
+
+    fn namespace_uri(&self, prefix: &[u8]) -> Option<&str> {
+        let prefix = str::from_utf8(prefix).ok()?;
+        self.stack
+            .last()
+            .and_then(|namespaces| namespaces.get(prefix))
+            .map(String::as_str)
+    }
+}
+
+fn apply_namespace_declarations(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    namespaces: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| error.to_string())?;
+        let key = attribute.key.as_ref();
+        let Some(prefix) = namespace_declaration_prefix(key) else {
+            continue;
+        };
+        let prefix = str::from_utf8(prefix).map_err(|error| error.to_string())?;
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .map_err(|error| error.to_string())?;
+        namespaces.insert(prefix.to_string(), value.into_owned());
+    }
+
+    Ok(())
+}
+
+fn namespace_declaration_prefix(name: &[u8]) -> Option<&[u8]> {
+    if name == b"xmlns" {
+        Some(b"")
+    } else {
+        name.strip_prefix(b"xmlns:")
+    }
+}
+
+fn dublin_core_local_name<'a>(name: &'a [u8], namespaces: &NamespaceContext) -> Option<&'a [u8]> {
+    if let Some((uri, local_name)) = expanded_name_parts(name) {
+        return (uri == DUBLIN_CORE_NAMESPACE).then_some(local_name);
+    }
+
+    let (prefix, local_name) = prefixed_name_parts(name);
+    let prefix = prefix.unwrap_or(b"");
+    namespaces
+        .namespace_uri(prefix)
+        .filter(|uri| uri.as_bytes() == DUBLIN_CORE_NAMESPACE)
+        .map(|_| local_name)
+}
+
+fn expanded_name_parts(name: &[u8]) -> Option<(&[u8], &[u8])> {
+    let separator = name.iter().position(|byte| *byte == b'}')?;
+    let uri = if name.first() == Some(&b'{') {
+        &name[1..separator]
+    } else {
+        &name[..separator]
+    };
+    let local_name = &name[separator + 1..];
+
+    if uri.is_empty() || local_name.is_empty() {
+        None
+    } else {
+        Some((uri, local_name))
+    }
+}
+
+fn prefixed_name_parts(name: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    if let Some(separator) = name.iter().position(|byte| *byte == b':') {
+        (Some(&name[..separator]), &name[separator + 1..])
+    } else {
+        (None, name)
+    }
 }
 
 #[derive(Default)]
@@ -564,6 +674,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn ignores_non_dublin_core_metadata_elements() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:custom="urn:not-dc" unique-identifier="book-id">
+              <metadata>
+                <custom:title>Wrong Title</custom:title>
+                <title>Wrong Unqualified Title</title>
+                <custom:creator>Wrong Author</custom:creator>
+                <custom:language>xx</custom:language>
+                <custom:identifier id="book-id">wrong-id</custom:identifier>
+                <dc:title>Right Title</dc:title>
+                <dc:creator>Right Author</dc:creator>
+                <dc:language>en</dc:language>
+                <dc:identifier id="book-id">right-id</dc:identifier>
+              </metadata>
+            </package>"#,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.title.as_deref(), Some("Right Title"));
+        assert_eq!(metadata.authors, vec!["Right Author"]);
+        assert_eq!(metadata.language.as_deref(), Some("en"));
+        assert_eq!(
+            metadata.identifiers,
+            vec![MetadataIdentifier {
+                value: "right-id".to_string(),
+                scheme: None,
+                is_unique: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn reads_dublin_core_elements_from_default_namespace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r#"<?xml version="1.0"?>
+            <package unique-identifier="book-id">
+              <metadata xmlns="http://purl.org/dc/elements/1.1/">
+                <title>Default Namespace Title</title>
+                <creator>Default Namespace Author</creator>
+                <language>en</language>
+                <identifier id="book-id">default-id</identifier>
+              </metadata>
+            </package>"#,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.title.as_deref(), Some("Default Namespace Title"));
+        assert_eq!(metadata.authors, vec!["Default Namespace Author"]);
+        assert_eq!(metadata.language.as_deref(), Some("en"));
+        assert_eq!(metadata.identifiers[0].value, "default-id");
     }
 
     #[test]
