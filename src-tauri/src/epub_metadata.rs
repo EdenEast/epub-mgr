@@ -697,7 +697,7 @@ impl ParsedPackage {
 
         SeriesSelection {
             series: None,
-            series_index: self.calibre_series_index.clone(),
+            series_index: None,
             warnings,
         }
     }
@@ -1020,6 +1020,30 @@ mod tests {
         assert_eq!(metadata.series.as_deref(), Some("First Series"));
         assert_eq!(metadata.series_index.as_deref(), Some("3"));
         assert_eq!(metadata.warnings, vec!["ambiguous_series"]);
+    }
+
+    #[test]
+    fn ignores_unpaired_calibre_series_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let epub_path = temp.path().join("book.epub");
+        write_epub(
+            &epub_path,
+            "content.opf",
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Standalone Index</dc:title>
+                <dc:creator>Index Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta name="calibre:series_index" content="3"/>
+              </metadata>
+            </package>"#,
+        );
+
+        let metadata = read_embedded_metadata(&epub_path).expect("metadata");
+
+        assert_eq!(metadata.series, None);
+        assert_eq!(metadata.series_index, None);
     }
 
     #[test]
