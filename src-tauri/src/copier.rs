@@ -58,7 +58,8 @@ pub fn copy_cleaned_epub(source_path: &Path, target_path: &Path) -> Result<CopyO
         return Ok(CopyOutcome::OutputExists);
     }
 
-    let (temp_path, temp_file) = create_unique_temp_file(parent, target_path)?;
+    let (temp_path, temp_file) =
+        create_unique_temp_file_with_next_temp_id(parent, target_path, &NEXT_TEMP_ID)?;
 
     match copy_via_temp(source_path, target_path, &temp_path, temp_file) {
         Ok(outcome) => Ok(outcome),
@@ -114,12 +115,13 @@ fn target_exists(target_path: &Path) -> Result<bool, CopyError> {
         .map_err(|error| CopyError::io("check whether output exists", target_path, error))
 }
 
-fn create_unique_temp_file(
+fn create_unique_temp_file_with_next_temp_id(
     parent: &Path,
     target_path: &Path,
+    next_temp_id: &AtomicU64,
 ) -> Result<(PathBuf, File), CopyError> {
     for _ in 0..100 {
-        let temp_path = parent.join(unique_temp_file_name(target_path)?);
+        let temp_path = parent.join(unique_temp_file_name(target_path, next_temp_id)?);
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -143,14 +145,24 @@ fn create_unique_temp_file(
     )))
 }
 
-fn unique_temp_file_name(target_path: &Path) -> Result<OsString, CopyError> {
+fn unique_temp_file_name(
+    target_path: &Path,
+    next_temp_id: &AtomicU64,
+) -> Result<OsString, CopyError> {
+    let counter = next_temp_id.fetch_add(1, Ordering::Relaxed);
+    unique_temp_file_name_for_counter(target_path, counter)
+}
+
+fn unique_temp_file_name_for_counter(
+    target_path: &Path,
+    counter: u64,
+) -> Result<OsString, CopyError> {
     let final_name = target_path.file_name().ok_or_else(|| {
         CopyError::new(format!(
             "Cleaned EPUB output path has no file name: {}",
             target_path.display()
         ))
     })?;
-    let counter = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let mut temp_name = OsString::from(".");
     temp_name.push(final_name);
     temp_name.push(format!(".tmp.{}.{}", std::process::id(), counter));
@@ -219,4 +231,38 @@ fn rename_without_replace(_source_path: &Path, _target_path: &Path) -> io::Resul
         io::ErrorKind::Unsupported,
         "atomic no-overwrite rename is not implemented on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn create_unique_temp_file_uses_a_fresh_name_when_a_candidate_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target_path = temp.path().join("output").join("nested").join("book.epub");
+        let target_parent = target_path.parent().expect("target parent");
+        let next_temp_id = AtomicU64::new(0);
+        fs::create_dir_all(target_parent).expect("create target parent");
+
+        let reserved_temp_path = target_parent.join(
+            unique_temp_file_name_for_counter(&target_path, 0)
+                .expect("reserved temporary file name"),
+        );
+        fs::write(&reserved_temp_path, b"reserved temp must survive")
+            .expect("reserve next temp candidate");
+
+        let (temp_path, _temp_file) =
+            create_unique_temp_file_with_next_temp_id(target_parent, &target_path, &next_temp_id)
+                .expect("create unique temp file");
+
+        assert_ne!(temp_path, reserved_temp_path);
+        assert_eq!(temp_path.parent(), Some(target_parent));
+        assert!(temp_path.exists());
+        assert_eq!(
+            fs::read(&reserved_temp_path).expect("read reserved temp"),
+            b"reserved temp must survive"
+        );
+    }
 }
