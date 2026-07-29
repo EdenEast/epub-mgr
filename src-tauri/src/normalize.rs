@@ -871,6 +871,33 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_uses_calibre_series_metadata_in_default_planned_path_when_epub3_is_absent() {
+        let report = dry_run_single_epub_report(
+            r#"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Fallback Title</dc:title>
+                <dc:creator>Fallback Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta name="calibre:series" content="Calibre Cycle"/>
+                <meta name="calibre:series_index" content="2"/>
+              </metadata>
+            </package>"#,
+        );
+
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(PathBuf::from(
+                "Fallback Author/Calibre Cycle/02 Fallback Title.epub"
+            ))
+        );
+        assert!(report.entries[0].warnings.is_empty());
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("Calibre Cycle"));
+        assert_eq!(metadata.series_index.as_deref(), Some("2"));
+    }
+
+    #[test]
     fn dry_run_includes_series_warnings_in_report_entries() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_library = temp.path().join("source-library");
@@ -904,6 +931,37 @@ mod tests {
         let metadata = report.entries[0].metadata.as_ref().expect("metadata");
         assert_eq!(metadata.series.as_deref(), Some("EPUB Series"));
         assert_eq!(metadata.series_index.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn dry_run_warns_and_chooses_first_supported_series_for_planned_path() {
+        let report = dry_run_single_epub_report(
+            r##"<?xml version="1.0"?>
+            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <metadata>
+                <dc:title>Ambiguous Title</dc:title>
+                <dc:creator>Ambiguous Author</dc:creator>
+                <dc:language>en</dc:language>
+                <meta property="belongs-to-collection" id="first">First Cycle</meta>
+                <meta property="collection-type" refines="#first">series</meta>
+                <meta property="group-position" refines="#first">3</meta>
+                <meta property="belongs-to-collection" id="second">Second Cycle</meta>
+                <meta property="collection-type" refines="#second">series</meta>
+                <meta property="group-position" refines="#second">4</meta>
+              </metadata>
+            </package>"##,
+        );
+
+        assert_eq!(
+            report.entries[0].output_path,
+            Some(PathBuf::from(
+                "Ambiguous Author/First Cycle/03 Ambiguous Title.epub"
+            ))
+        );
+        assert_eq!(report.entries[0].warnings, vec!["ambiguous_series"]);
+        let metadata = report.entries[0].metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.series.as_deref(), Some("First Cycle"));
+        assert_eq!(metadata.series_index.as_deref(), Some("3"));
     }
 
     #[test]
@@ -1182,6 +1240,21 @@ mod tests {
             human_summary(&report),
             "normalize summary: scanned=1 planned=1 copied=0 skipped=0 errored=0\nwould copy: source/book.epub -> Author/Series/01 Title.epub"
         );
+    }
+
+    fn dry_run_single_epub_report(opf: impl AsRef<str>) -> NormalizeReport {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), opf);
+
+        normalize(NormalizeConfig {
+            source_library,
+            output_library: temp.path().join("output-library"),
+            output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+            dry_run: true,
+        })
+        .expect("dry-run report")
     }
 
     fn complete_opf(title: &str) -> String {
