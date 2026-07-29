@@ -269,8 +269,8 @@ fn parse_package_metadata(
                     if element_name == b"metadata" {
                         in_metadata = false;
                         metadata_depth = 0;
-                    } else if metadata_depth > 0 {
-                        metadata_depth -= 1;
+                    } else {
+                        metadata_depth = metadata_depth.saturating_sub(1);
                     }
                 }
 

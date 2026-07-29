@@ -591,7 +591,7 @@ mod tests {
             output_path.parent().expect("parent").is_dir(),
             "real run must create parent directories for Cleaned EPUBs"
         );
-        assert_eq!(report.config.dry_run, false);
+        assert!(!report.config.dry_run);
         assert_eq!(report.totals.scanned, 1);
         assert_eq!(report.totals.planned, 1);
         assert_eq!(report.totals.copied, 1);

@@ -286,7 +286,7 @@ fn is_reserved_name(segment: &str) -> bool {
         })
 }
 
-fn metadata_value<'a>(metadata: &'a NormalizedMetadata, field: Field) -> Option<&'a str> {
+fn metadata_value(metadata: &NormalizedMetadata, field: Field) -> Option<&str> {
     match field {
         Field::Title => metadata.title.as_deref(),
         Field::Author => metadata.author.as_deref(),
