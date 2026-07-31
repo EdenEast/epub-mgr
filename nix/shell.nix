@@ -19,7 +19,7 @@ _: {
       nativeBuildInputs = [rusttoolchain];
       packages = with pkgs; [
         just
-        nodejs_22
+        nodejs
         pkg-config
         glib-networking
         libsoup_3
