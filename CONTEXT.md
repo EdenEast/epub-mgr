@@ -13,7 +13,7 @@ The destination root where cleaned EPUB copies are written using normalized path
 _Avoid_: Destination folder, output folder
 
 **Cleaned EPUB**:
-A copied EPUB whose file path follows the output library's normalization rules, based only on metadata already present in the source EPUB.
+A copied EPUB whose file path follows the output library's normalization rules. By default, it is based only on metadata already present in the source EPUB. When metadata enrichment is explicitly applied, the copied EPUB in the Output Library may also contain confirmed or high-confidence updated package metadata; the Source Library remains read-only.
 _Avoid_: Updated original, processed file
 
 **Output Path Template**:

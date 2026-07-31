@@ -10,7 +10,13 @@ use serde::Serialize;
 
 use crate::{
     copier::{copy_cleaned_epub, CopyOutcome},
+    enrichment::{
+        merge::{enrich_metadata, EnrichmentReport, EnrichmentStatus, FieldPatch},
+        providers::ChainedMetadataProvider,
+        EnrichmentConfig, EnrichmentMode, MetadataProvider,
+    },
     epub_metadata::{read_embedded_metadata, NormalizedMetadata},
+    epub_writer::{copy_epub_with_metadata_patches, EpubWriteError},
     output_path::{render_output_path, NormalizedMetadata as OutputPathMetadata},
 };
 
@@ -22,6 +28,7 @@ pub struct NormalizeConfig {
     pub output_library: PathBuf,
     pub output_path_template: String,
     pub dry_run: bool,
+    pub enrichment: Option<EnrichmentConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -30,6 +37,8 @@ pub struct ReportConfig {
     pub output_library: PathBuf,
     pub template: String,
     pub dry_run: bool,
+    pub enrich: bool,
+    pub apply_enrichment: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -47,6 +56,7 @@ pub struct ReportEntry {
     pub output_path: Option<PathBuf>,
     pub action: EntryAction,
     pub metadata: Option<NormalizedMetadata>,
+    pub enrichment: Option<EnrichmentReport>,
     pub warnings: Vec<String>,
     pub error: Option<ReportError>,
 }
@@ -126,6 +136,14 @@ impl fmt::Display for NormalizeError {
 impl std::error::Error for NormalizeError {}
 
 pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeError> {
+    let provider = ChainedMetadataProvider::default();
+    normalize_with_optional_provider(config, Some(&provider))
+}
+
+fn normalize_with_optional_provider(
+    config: NormalizeConfig,
+    provider: Option<&dyn MetadataProvider>,
+) -> Result<NormalizeReport, NormalizeError> {
     if !config.source_library.is_dir() {
         return Err(NormalizeError::SourceLibraryNotDirectory(
             config.source_library,
@@ -143,10 +161,15 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
     let mut planned_output_paths = HashSet::new();
     let entries: Vec<ReportEntry> = source_paths
         .into_iter()
-        .map(|source_path| build_entry(source_path, &config, &mut planned_output_paths))
+        .map(|source_path| build_entry(source_path, &config, provider, &mut planned_output_paths))
         .collect();
 
     let totals = totals_for(&entries);
+    let enrich = config.enrichment.is_some();
+    let apply_enrichment = config
+        .enrichment
+        .as_ref()
+        .is_some_and(|enrichment| enrichment.mode == EnrichmentMode::AutoApplyHighConfidence);
 
     Ok(NormalizeReport {
         config: ReportConfig {
@@ -154,6 +177,8 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
             output_library: config.output_library,
             template: config.output_path_template,
             dry_run: config.dry_run,
+            enrich,
+            apply_enrichment,
         },
         totals,
         entries,
@@ -163,6 +188,7 @@ pub fn normalize(config: NormalizeConfig) -> Result<NormalizeReport, NormalizeEr
 fn build_entry(
     source_path: PathBuf,
     config: &NormalizeConfig,
+    provider: Option<&dyn MetadataProvider>,
     planned_output_paths: &mut HashSet<PathBuf>,
 ) -> ReportEntry {
     let metadata = match read_embedded_metadata(&source_path) {
@@ -173,6 +199,7 @@ fn build_entry(
                 output_path: None,
                 action: EntryAction::Error,
                 metadata: None,
+                enrichment: None,
                 warnings: Vec::new(),
                 error: Some(ReportError {
                     code: error.code().to_string(),
@@ -184,7 +211,45 @@ fn build_entry(
 
     let mut warnings = metadata.missing_required_warnings();
     warnings.extend(metadata.warnings.clone());
-    let output_path_metadata = output_path_metadata(&metadata);
+
+    let (effective_metadata, enrichment_report, applied_patches) =
+        match (&config.enrichment, provider) {
+            (Some(enrichment_config), Some(provider)) => {
+                let outcome = enrich_metadata(&metadata, provider, enrichment_config.mode);
+                warnings.extend(outcome.report.warnings.clone());
+                let applied_patches = outcome
+                    .report
+                    .patches
+                    .iter()
+                    .filter(|patch| patch.applied)
+                    .cloned()
+                    .collect();
+                (outcome.metadata, Some(outcome.report), applied_patches)
+            }
+            _ => (metadata.clone(), None, Vec::new()),
+        };
+
+    if !config.dry_run
+        && enrichment_report
+            .as_ref()
+            .is_some_and(|report| report.status == EnrichmentStatus::LookupFailed)
+    {
+        return ReportEntry {
+            source_path,
+            output_path: None,
+            action: EntryAction::Error,
+            metadata: Some(metadata),
+            enrichment: enrichment_report,
+            warnings,
+            error: Some(ReportError {
+                code: "enrichment_lookup_failed".to_string(),
+                message: "metadata enrichment lookup failed; no Cleaned EPUB was written"
+                    .to_string(),
+            }),
+        };
+    }
+
+    let output_path_metadata = output_path_metadata(&effective_metadata);
 
     match render_output_path(&config.output_path_template, &output_path_metadata) {
         Ok(rendered) => {
@@ -196,7 +261,8 @@ fn build_entry(
                 return skipped_entry(
                     source_path,
                     relative_output_path,
-                    metadata,
+                    effective_metadata,
+                    enrichment_report,
                     warnings,
                     "run_collision",
                     "multiple source EPUBs render to the same output path",
@@ -208,7 +274,8 @@ fn build_entry(
                     source_path,
                     output_path: Some(relative_output_path),
                     action: EntryAction::WouldCopy,
-                    metadata: Some(metadata),
+                    metadata: Some(effective_metadata),
+                    enrichment: enrichment_report,
                     warnings,
                     error: None,
                 };
@@ -218,7 +285,9 @@ fn build_entry(
                 source_path,
                 final_output_path,
                 relative_output_path,
-                metadata,
+                effective_metadata,
+                enrichment_report,
+                applied_patches,
                 warnings,
             )
         }
@@ -226,7 +295,8 @@ fn build_entry(
             source_path,
             output_path: None,
             action: EntryAction::Error,
-            metadata: Some(metadata),
+            metadata: Some(effective_metadata),
+            enrichment: enrichment_report,
             warnings,
             error: Some(ReportError {
                 code: "path_render_error".to_string(),
@@ -241,14 +311,56 @@ fn copy_entry(
     final_output_path: PathBuf,
     report_output_path: PathBuf,
     metadata: NormalizedMetadata,
+    enrichment: Option<EnrichmentReport>,
+    applied_patches: Vec<FieldPatch>,
     warnings: Vec<String>,
 ) -> ReportEntry {
+    if !applied_patches.is_empty() {
+        return match copy_epub_with_metadata_patches(
+            &source_path,
+            &final_output_path,
+            &applied_patches,
+        ) {
+            Ok(()) => ReportEntry {
+                source_path,
+                output_path: Some(report_output_path),
+                action: EntryAction::Copied,
+                metadata: Some(metadata),
+                enrichment,
+                warnings,
+                error: None,
+            },
+            Err(EpubWriteError::OutputExists) => skipped_entry(
+                source_path,
+                report_output_path,
+                metadata,
+                enrichment,
+                warnings,
+                "output_exists",
+                "output path already exists",
+            ),
+            Err(error) => ReportEntry {
+                source_path,
+                output_path: Some(report_output_path),
+                action: EntryAction::Error,
+                metadata: Some(metadata),
+                enrichment,
+                warnings,
+                error: Some(ReportError {
+                    code: "metadata_write_error".to_string(),
+                    message: error.to_string(),
+                }),
+            },
+        };
+    }
+
     match copy_cleaned_epub(&source_path, &final_output_path) {
         Ok(CopyOutcome::Copied) => ReportEntry {
             source_path,
             output_path: Some(report_output_path),
             action: EntryAction::Copied,
             metadata: Some(metadata),
+            enrichment,
             warnings,
             error: None,
         },
@@ -256,6 +368,7 @@ fn copy_entry(
             source_path,
             report_output_path,
             metadata,
+            enrichment,
             warnings,
             "output_exists",
             "output path already exists",
@@ -265,6 +378,7 @@ fn copy_entry(
             output_path: Some(report_output_path),
             action: EntryAction::Error,
             metadata: Some(metadata),
+            enrichment,
             warnings,
             error: Some(ReportError {
                 code: "copy_error".to_string(),
@@ -278,6 +392,7 @@ fn skipped_entry(
     source_path: PathBuf,
     output_path: PathBuf,
     metadata: NormalizedMetadata,
+    enrichment: Option<EnrichmentReport>,
     warnings: Vec<String>,
     code: &str,
     message: &str,
@@ -287,6 +402,7 @@ fn skipped_entry(
         output_path: Some(output_path.clone()),
         action: EntryAction::Skipped,
         metadata: Some(metadata),
+        enrichment,
         warnings,
         error: Some(ReportError {
             code: code.to_string(),
@@ -460,6 +576,45 @@ mod tests {
     use std::{fs, io::Write, path::Path};
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
+    use crate::enrichment::{
+        CandidateEvidence, Confidence, EnrichmentCandidate, LookupRequest, Provenance,
+        ProvenancedValue, ProviderError,
+    };
+
+    struct FakeProvider(Vec<EnrichmentCandidate>);
+
+    impl MetadataProvider for FakeProvider {
+        fn lookup(
+            &self,
+            _request: &LookupRequest,
+        ) -> Result<Vec<EnrichmentCandidate>, ProviderError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingProvider;
+
+    impl MetadataProvider for FailingProvider {
+        fn lookup(
+            &self,
+            _request: &LookupRequest,
+        ) -> Result<Vec<EnrichmentCandidate>, ProviderError> {
+            Err(ProviderError::new("Open Library", "network unavailable"))
+        }
+    }
+
+    fn high_confidence_value(value: &str) -> ProvenancedValue<String> {
+        ProvenancedValue {
+            value: value.to_string(),
+            confidence: Confidence::High,
+            provenance: Provenance {
+                source: "Wikidata".to_string(),
+                record_id: "Q2136877".to_string(),
+                url: "https://www.wikidata.org/wiki/Q2136877".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn dry_run_scans_nested_epubs_without_creating_output_library() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -476,6 +631,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -508,6 +664,187 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_enrichment_reports_proposed_series_without_writing_output_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            complete_opf("The Way of Kings"),
+        );
+
+        let candidate = EnrichmentCandidate {
+            series: Some(high_confidence_value("The Stormlight Archive")),
+            series_index: Some(high_confidence_value("1")),
+            evidence: CandidateEvidence {
+                identifier_match: true,
+                title_author_match: true,
+                structured_series: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let report = normalize_with_optional_provider(
+            NormalizeConfig {
+                source_library,
+                output_library: output_library.clone(),
+                output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+                dry_run: true,
+                enrichment: Some(EnrichmentConfig {
+                    mode: EnrichmentMode::ProposeOnly,
+                }),
+            },
+            Some(&FakeProvider(vec![candidate])),
+        )
+        .expect("dry-run report");
+
+        assert!(!output_library.exists());
+        assert_eq!(report.config.enrich, true);
+        assert_eq!(report.entries[0].action, EntryAction::WouldCopy);
+        let enrichment = report.entries[0]
+            .enrichment
+            .as_ref()
+            .expect("enrichment report");
+        assert!(!enrichment.applied);
+        assert_eq!(enrichment.patches.len(), 2);
+        assert_eq!(
+            report.entries[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.series.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn real_run_auto_applies_high_confidence_series_to_cleaned_epub_path_and_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(
+            &source_library.join("book.epub"),
+            complete_opf("The Way of Kings"),
+        );
+
+        let candidate = EnrichmentCandidate {
+            series: Some(high_confidence_value("The Stormlight Archive")),
+            series_index: Some(high_confidence_value("1")),
+            evidence: CandidateEvidence {
+                identifier_match: true,
+                title_author_match: true,
+                structured_series: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let report = normalize_with_optional_provider(
+            NormalizeConfig {
+                source_library,
+                output_library: output_library.clone(),
+                output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+                dry_run: false,
+                enrichment: Some(EnrichmentConfig {
+                    mode: EnrichmentMode::AutoApplyHighConfidence,
+                }),
+            },
+            Some(&FakeProvider(vec![candidate])),
+        )
+        .expect("real run report");
+
+        assert_eq!(report.entries[0].action, EntryAction::Copied);
+        assert_eq!(
+            report.entries[0].output_path.as_deref(),
+            Some(Path::new(
+                "Test Author/The Stormlight Archive/01 The Way of Kings.epub"
+            ))
+        );
+        let cleaned_epub = output_library.join(report.entries[0].output_path.as_ref().unwrap());
+        let updated = read_embedded_metadata(&cleaned_epub).expect("updated metadata readable");
+        assert_eq!(updated.series.as_deref(), Some("The Stormlight Archive"));
+        assert_eq!(updated.series_index.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn real_run_enrichment_lookup_failure_does_not_write_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_library = temp.path().join("source-library");
+        let output_library = temp.path().join("output-library");
+        fs::create_dir_all(&source_library).expect("create Source Library");
+        write_epub_with_opf(&source_library.join("book.epub"), complete_opf("Book"));
+
+        let report = normalize_with_optional_provider(
+            NormalizeConfig {
+                source_library,
+                output_library: output_library.clone(),
+                output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
+                dry_run: false,
+                enrichment: Some(EnrichmentConfig {
+                    mode: EnrichmentMode::AutoApplyHighConfidence,
+                }),
+            },
+            Some(&FailingProvider),
+        )
+        .expect("real run report");
+
+        assert_eq!(report.entries[0].action, EntryAction::Error);
+        assert_eq!(
+            report.entries[0]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("enrichment_lookup_failed")
+        );
+        assert!(!output_library.exists());
+        assert_eq!(report.totals.copied, 0);
+    }
+
+    #[test]
+    fn ambiguous_enrichment_candidates_are_not_auto_applied() {
+        let metadata = NormalizedMetadata {
+            title: Some("Shared Title".to_string()),
+            authors: vec!["Author".to_string()],
+            ..Default::default()
+        };
+        let candidate = EnrichmentCandidate {
+            series: Some(high_confidence_value("Series One")),
+            evidence: CandidateEvidence {
+                identifier_match: true,
+                title_author_match: true,
+                structured_series: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let other = EnrichmentCandidate {
+            series: Some(high_confidence_value("Series Two")),
+            evidence: CandidateEvidence {
+                identifier_match: true,
+                title_author_match: true,
+                structured_series: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let outcome = enrich_metadata(
+            &metadata,
+            &FakeProvider(vec![candidate, other]),
+            EnrichmentMode::AutoApplyHighConfidence,
+        );
+
+        assert_eq!(outcome.metadata.series, None);
+        assert!(!outcome.report.applied);
+        assert!(outcome
+            .report
+            .warnings
+            .contains(&"ambiguous_enrichment_match".to_string()));
+    }
+
+    #[test]
     fn dry_run_reports_run_collisions_without_creating_output_library() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_library = temp.path().join("source-library");
@@ -527,6 +864,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: "{author}/{title}.epub".to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -555,6 +893,7 @@ mod tests {
             output_library: temp.path().join("output"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect_err("missing Source Library should fail");
 
@@ -580,6 +919,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: "{author}/{title}.epub".to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect("real-run report");
 
@@ -624,6 +964,7 @@ mod tests {
             output_library,
             output_path_template: "{author}/{title}.epub".to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect("real-run report");
 
@@ -669,6 +1010,7 @@ mod tests {
             output_library,
             output_path_template: "{author}/{title}.epub".to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect("real-run report should include per-file errors");
 
@@ -709,6 +1051,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect_err("real run must not modify Source Library");
 
@@ -738,6 +1081,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect_err("real run must reject overlapping libraries");
 
@@ -768,6 +1112,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: false,
+            enrichment: None,
         })
         .expect_err("real run must reject normalized overlap");
 
@@ -807,6 +1152,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -850,6 +1196,7 @@ mod tests {
             output_library: output_library.clone(),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -924,6 +1271,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -983,6 +1331,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -1023,6 +1372,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -1060,6 +1410,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report should continue");
 
@@ -1084,6 +1435,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report should continue");
 
@@ -1111,6 +1463,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: "{author}/{title}.epub".to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
         write_json_report(&report, report_path.clone()).expect("write JSON report");
@@ -1157,6 +1510,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: "{series}/{title}.epub".to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report");
 
@@ -1193,6 +1547,8 @@ mod tests {
                 output_library: PathBuf::from("output"),
                 template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
                 dry_run: true,
+                enrich: false,
+                apply_enrichment: false,
             },
             totals: Totals {
                 scanned: 3,
@@ -1218,6 +1574,8 @@ mod tests {
                 output_library: PathBuf::from("output"),
                 template: "{author}/[{series}/{series_index:02} ]{title}.epub".to_string(),
                 dry_run: true,
+                enrich: false,
+                apply_enrichment: false,
             },
             totals: Totals {
                 scanned: 1,
@@ -1231,6 +1589,7 @@ mod tests {
                 output_path: Some(PathBuf::from("Author/Series/01 Title.epub")),
                 action: EntryAction::WouldCopy,
                 metadata: None,
+                enrichment: None,
                 warnings: Vec::new(),
                 error: None,
             }],
@@ -1253,6 +1612,7 @@ mod tests {
             output_library: temp.path().join("output-library"),
             output_path_template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
             dry_run: true,
+            enrichment: None,
         })
         .expect("dry-run report")
     }
