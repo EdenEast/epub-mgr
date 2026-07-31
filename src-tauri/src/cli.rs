@@ -2,8 +2,11 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::normalize::{
-    human_summary, normalize, write_json_report, NormalizeConfig, DEFAULT_OUTPUT_PATH_TEMPLATE,
+use crate::{
+    enrichment::{EnrichmentConfig, EnrichmentMode},
+    normalize::{
+        human_summary, normalize, write_json_report, NormalizeConfig, DEFAULT_OUTPUT_PATH_TEMPLATE,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -36,6 +39,14 @@ struct NormalizeArgs {
     /// Plan the run without creating Output Library directories or copying EPUBs.
     #[arg(long)]
     dry_run: bool,
+
+    /// Look up title, author, series, and series number enrichment proposals.
+    #[arg(long)]
+    enrich: bool,
+
+    /// Apply high-confidence enrichment to copied Cleaned EPUBs.
+    #[arg(long, requires = "enrich")]
+    apply_enrichment: bool,
 
     /// Optional path for a JSON report.
     #[arg(long)]
@@ -84,6 +95,13 @@ fn run(cli: Cli) -> Result<String, Box<dyn std::error::Error>> {
                 output_library: args.output_library,
                 output_path_template: args.template,
                 dry_run: args.dry_run,
+                enrichment: args.enrich.then_some(EnrichmentConfig {
+                    mode: if args.apply_enrichment {
+                        EnrichmentMode::AutoApplyHighConfidence
+                    } else {
+                        EnrichmentMode::ProposeOnly
+                    },
+                }),
             })?;
 
             if let Some(report_path) = args.report {
@@ -122,8 +140,48 @@ mod tests {
                 output_library: PathBuf::from("output"),
                 template: DEFAULT_OUTPUT_PATH_TEMPLATE.to_string(),
                 dry_run: true,
+                enrich: false,
+                apply_enrichment: false,
                 report: Some(PathBuf::from("report.json")),
             }
+        );
+    }
+
+    #[test]
+    fn parses_enrichment_flags() {
+        let cli = Cli::try_parse_from([
+            "epub-mgr",
+            "normalize",
+            "--source-library",
+            "source",
+            "--output-library",
+            "output",
+            "--enrich",
+            "--apply-enrichment",
+        ])
+        .expect("valid enrichment args");
+
+        let Commands::Normalize(args) = cli.command;
+        assert!(args.enrich);
+        assert!(args.apply_enrichment);
+    }
+
+    #[test]
+    fn apply_enrichment_requires_enrich() {
+        let error = Cli::try_parse_from([
+            "epub-mgr",
+            "normalize",
+            "--source-library",
+            "source",
+            "--output-library",
+            "output",
+            "--apply-enrichment",
+        ])
+        .expect_err("apply-enrichment without enrich should fail parsing");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 

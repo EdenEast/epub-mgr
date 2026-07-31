@@ -5,7 +5,9 @@ use tauri::{AppHandle, Emitter};
 
 pub mod cli;
 pub mod copier;
+pub mod enrichment;
 pub mod epub_metadata;
+pub mod epub_writer;
 pub mod normalize;
 pub mod output_path;
 
