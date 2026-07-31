@@ -1288,7 +1288,56 @@ mod tests {
         .expect("write container");
         zip.start_file("OPS/content.opf", options)
             .expect("start OPF");
-        zip.write_all(opf.as_ref().as_bytes()).expect("write OPF");
+        zip.write_all(valid_test_opf(opf.as_ref()).as_bytes())
+            .expect("write OPF");
+        zip.start_file("OPS/chapter.xhtml", options)
+            .expect("start chapter");
+        zip.write_all(b"<html><body>Chapter</body></html>")
+            .expect("write chapter");
         zip.finish().expect("finish EPUB");
+    }
+
+    fn valid_test_opf(opf: &str) -> String {
+        let opf = add_opf_namespace(opf);
+        add_minimal_reading_order(&opf)
+    }
+
+    fn add_opf_namespace(opf: &str) -> String {
+        let Some(package_start) = opf.find("<package") else {
+            return opf.to_string();
+        };
+        let Some(relative_tag_end) = opf[package_start..].find('>') else {
+            return opf.to_string();
+        };
+        let tag_end = package_start + relative_tag_end;
+        let package_tag = &opf[package_start..tag_end];
+        let mut declarations = String::new();
+        if !package_tag.contains("xmlns=\"") {
+            declarations.push_str(" xmlns=\"http://www.idpf.org/2007/opf\"");
+        }
+        if !package_tag.contains("xmlns:opf=\"") {
+            declarations.push_str(" xmlns:opf=\"http://www.idpf.org/2007/opf\"");
+        }
+        if declarations.is_empty() {
+            return opf.to_string();
+        }
+
+        let mut with_namespace = String::with_capacity(opf.len() + declarations.len());
+        with_namespace.push_str(&opf[..tag_end]);
+        with_namespace.push_str(&declarations);
+        with_namespace.push_str(&opf[tag_end..]);
+        with_namespace
+    }
+
+    fn add_minimal_reading_order(opf: &str) -> String {
+        let additions = r#"
+              <manifest>
+                <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine>
+                <itemref idref="chapter"/>
+              </spine>
+        "#;
+        opf.replacen("</package>", &format!("{additions}</package>"), 1)
     }
 }

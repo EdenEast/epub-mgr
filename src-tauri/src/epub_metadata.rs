@@ -1,14 +1,8 @@
-use std::{collections::HashMap, fmt, fs::File, io::Read, path::Path, str};
+use std::{fmt, path::Path};
 
-use quick_xml::{
-    escape::unescape,
-    events::{BytesStart, Event},
-    Reader, XmlVersion,
-};
+use epub::doc::{DocError, EpubDoc, MetadataItem};
 use serde::Serialize;
-use zip::ZipArchive;
 
-const DUBLIN_CORE_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
 const AMBIGUOUS_SERIES_WARNING: &str = "ambiguous_series";
 const SERIES_CONFLICT_WARNING: &str = "series_conflict";
 
@@ -100,703 +94,156 @@ impl fmt::Display for EpubMetadataError {
 impl std::error::Error for EpubMetadataError {}
 
 pub fn read_embedded_metadata(epub_path: &Path) -> Result<NormalizedMetadata, EpubMetadataError> {
-    let file = File::open(epub_path).map_err(|error| EpubMetadataError::UnreadableEpub {
-        message: error.to_string(),
-    })?;
-    let mut archive = ZipArchive::new(file).map_err(|error| EpubMetadataError::UnreadableEpub {
-        message: error.to_string(),
-    })?;
-
-    let container_xml = read_container_xml(&mut archive)?;
-    let package_path = package_document_path(&container_xml)?;
-    let package_xml = read_package_document(&mut archive, &package_path)?;
-
-    parse_package_metadata(&package_xml, &package_path)
+    let doc = EpubDoc::new(epub_path).map_err(map_epub_error)?;
+    Ok(normalize_doc_metadata(&doc))
 }
 
-fn read_container_xml(archive: &mut ZipArchive<File>) -> Result<String, EpubMetadataError> {
-    let mut container = archive
-        .by_name("META-INF/container.xml")
-        .map_err(|_| EpubMetadataError::MissingContainer)?;
-    read_zip_file_to_string(&mut container)
-        .map_err(|error| EpubMetadataError::MalformedContainer { message: error })
-}
-
-fn read_package_document(
-    archive: &mut ZipArchive<File>,
-    package_path: &str,
-) -> Result<String, EpubMetadataError> {
-    let mut package =
-        archive
-            .by_name(package_path)
-            .map_err(|_| EpubMetadataError::MissingPackageDocument {
-                path: package_path.to_string(),
-            })?;
-    read_zip_file_to_string(&mut package).map_err(|message| {
-        EpubMetadataError::MalformedPackageDocument {
-            path: package_path.to_string(),
-            message,
-        }
-    })
-}
-
-fn read_zip_file_to_string<R: Read>(reader: &mut R) -> Result<String, String> {
-    let mut contents = String::new();
-    reader
-        .read_to_string(&mut contents)
-        .map_err(|error| error.to_string())?;
-    Ok(contents)
-}
-
-fn package_document_path(container_xml: &str) -> Result<String, EpubMetadataError> {
-    let mut reader = Reader::from_str(container_xml);
-    reader.config_mut().trim_text(true);
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) | Ok(Event::Empty(element))
-                if local_name(element.name().as_ref()) == b"rootfile" =>
-            {
-                let path = attribute_value(&reader, &element, b"full-path")
-                    .map_err(|message| EpubMetadataError::MalformedContainer { message })?;
-
-                return path
-                    .filter(|path| !path.trim().is_empty())
-                    .map(|path| path.trim().to_string())
-                    .ok_or(EpubMetadataError::MissingRootfile);
-            }
-            Ok(Event::Eof) => return Err(EpubMetadataError::MissingRootfile),
-            Err(error) => {
-                return Err(EpubMetadataError::MalformedContainer {
-                    message: error.to_string(),
-                })
-            }
-            _ => {}
-        }
-    }
-}
-
-fn parse_package_metadata(
-    package_xml: &str,
-    package_path: &str,
-) -> Result<NormalizedMetadata, EpubMetadataError> {
-    let mut reader = Reader::from_str(package_xml);
-    reader.config_mut().trim_text(true);
-
-    let mut namespaces = NamespaceContext::default();
-    let mut unique_identifier_id = None;
-    let mut in_metadata = false;
-    let mut metadata_depth = 0usize;
-    let mut current = None;
-    let mut current_meta = None;
-    let mut parsed = ParsedPackage::default();
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                namespaces
-                    .push_from_element(&reader, &element)
-                    .map_err(|message| package_xml_error(package_path, message))?;
-                let name = element.name();
-                let element_name = local_name(name.as_ref());
-
-                if element_name == b"package" {
-                    unique_identifier_id = attribute_value(&reader, &element, b"unique-identifier")
-                        .map_err(|message| package_xml_error(package_path, message))?;
-                } else if element_name == b"metadata" {
-                    in_metadata = true;
-                    metadata_depth = 1;
-                } else if in_metadata {
-                    metadata_depth += 1;
-                    if let Some(target) =
-                        text_target_from_element(&reader, &element, &namespaces)
-                            .map_err(|message| package_xml_error(package_path, message))?
-                    {
-                        current = Some(target);
-                    } else if element_name == b"meta" {
-                        current_meta = meta_target_from_element(&reader, &element)
-                            .map_err(|message| package_xml_error(package_path, message))?;
-                    }
-                }
-            }
-            Ok(Event::Empty(element)) => {
-                let name = element.name();
-                let element_name = local_name(name.as_ref());
-
-                if element_name == b"package" {
-                    unique_identifier_id = attribute_value(&reader, &element, b"unique-identifier")
-                        .map_err(|message| package_xml_error(package_path, message))?;
-                } else if in_metadata && element_name == b"meta" {
-                    if let Some(meta) = meta_target_from_element(&reader, &element)
-                        .map_err(|message| package_xml_error(package_path, message))?
-                    {
-                        parsed.push_meta_target(meta);
-                    }
-                }
-            }
-            Ok(Event::Text(text)) => {
-                let decoded = text
-                    .xml10_content()
-                    .map_err(|error| package_xml_error(package_path, error.to_string()))?;
-                let unescaped = unescape(&decoded)
-                    .map_err(|error| package_xml_error(package_path, error.to_string()))?;
-                append_text(&mut current, &mut current_meta, &unescaped);
-            }
-            Ok(Event::CData(text)) => {
-                let decoded = text
-                    .decode()
-                    .map_err(|error| package_xml_error(package_path, error.to_string()))?;
-                append_text(&mut current, &mut current_meta, &decoded);
-            }
-            Ok(Event::End(element)) => {
-                let name = element.name();
-                let element_name = local_name(name.as_ref());
-
-                if in_metadata {
-                    if current
-                        .as_ref()
-                        .is_some_and(|target| target.kind.local_name() == element_name)
-                    {
-                        if let Some(target) = current.take() {
-                            parsed.push_text_target(target);
-                        }
-                    } else if element_name == b"meta" {
-                        if let Some(meta) = current_meta.take() {
-                            parsed.push_meta_target(meta);
-                        }
-                    }
-
-                    if element_name == b"metadata" {
-                        in_metadata = false;
-                        metadata_depth = 0;
-                    } else {
-                        metadata_depth = metadata_depth.saturating_sub(1);
-                    }
-                }
-
-                namespaces.pop();
-            }
-            Ok(Event::Eof) => {
-                if in_metadata || current.is_some() || current_meta.is_some() {
-                    return Err(package_xml_error(
-                        package_path,
-                        "unexpected end of package document".to_string(),
-                    ));
-                }
-                break;
-            }
-            Err(error) => return Err(package_xml_error(package_path, error.to_string())),
-            _ => {}
-        }
-    }
-
-    Ok(parsed.into_normalized(unique_identifier_id.as_deref()))
-}
-
-fn package_xml_error(package_path: &str, message: String) -> EpubMetadataError {
-    EpubMetadataError::MalformedPackageDocument {
-        path: package_path.to_string(),
-        message,
-    }
-}
-
-fn append_text(
-    current: &mut Option<TextTarget>,
-    current_meta: &mut Option<MetaTarget>,
-    text: &str,
-) {
-    if let Some(target) = current {
-        target.text.push_str(text);
-    }
-    if let Some(meta) = current_meta {
-        meta.text.push_str(text);
-    }
-}
-
-fn text_target_from_element(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-    namespaces: &NamespaceContext,
-) -> Result<Option<TextTarget>, String> {
-    let name = element.name();
-    let Some(element_name) = dublin_core_local_name(name.as_ref(), namespaces) else {
-        return Ok(None);
-    };
-
-    match element_name {
-        b"title" => Ok(Some(TextTarget::new(TextKind::Title))),
-        b"language" => Ok(Some(TextTarget::new(TextKind::Language))),
-        b"creator" => Ok(Some(TextTarget {
-            kind: TextKind::Creator {
-                id: attribute_value(reader, element, b"id")?,
-                role: attribute_value(reader, element, b"role")?,
-            },
-            text: String::new(),
-        })),
-        b"identifier" => Ok(Some(TextTarget {
-            kind: TextKind::Identifier {
-                id: attribute_value(reader, element, b"id")?,
-                scheme: attribute_value(reader, element, b"scheme")?,
-            },
-            text: String::new(),
-        })),
-        _ => Ok(None),
-    }
-}
-
-fn meta_target_from_element(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-) -> Result<Option<MetaTarget>, String> {
-    let property = attribute_value(reader, element, b"property")?;
-    let refines = attribute_value(reader, element, b"refines")?;
-    let id = attribute_value(reader, element, b"id")?;
-    let name = attribute_value(reader, element, b"name")?;
-    let content = attribute_value(reader, element, b"content")?.unwrap_or_default();
-
-    if let Some(name) = name.as_deref().map(str::trim) {
-        match name {
-            "calibre:series" => {
-                return Ok(Some(MetaTarget {
-                    kind: MetaKind::CalibreSeries,
-                    text: content,
-                }))
-            }
-            "calibre:series_index" => {
-                return Ok(Some(MetaTarget {
-                    kind: MetaKind::CalibreSeriesIndex,
-                    text: content,
-                }))
-            }
-            _ => {}
-        }
-    }
-
-    let refined_target_id = refines.as_deref().and_then(refined_target_id);
-
-    Ok(
-        match (property.as_deref().map(str::trim), refined_target_id) {
-            (Some("role"), Some(creator_id)) => Some(MetaTarget {
-                kind: MetaKind::RoleRefinement { creator_id },
-                text: String::new(),
-            }),
-            (Some("belongs-to-collection"), _) => id.map(|id| MetaTarget {
-                kind: MetaKind::Epub3Collection { id },
-                text: String::new(),
-            }),
-            (Some("collection-type"), Some(collection_id)) => Some(MetaTarget {
-                kind: MetaKind::CollectionType { collection_id },
-                text: String::new(),
-            }),
-            (Some("group-position"), Some(collection_id)) => Some(MetaTarget {
-                kind: MetaKind::GroupPosition { collection_id },
-                text: String::new(),
-            }),
-            _ => None,
+fn map_epub_error(error: DocError) -> EpubMetadataError {
+    match error {
+        DocError::IOError(error) => EpubMetadataError::UnreadableEpub {
+            message: error.to_string(),
         },
-    )
+        DocError::ArchiveError(error) => {
+            let message = error.to_string();
+            if message.contains("META-INF/container.xml") {
+                EpubMetadataError::MissingContainer
+            } else {
+                EpubMetadataError::UnreadableEpub { message }
+            }
+        }
+        DocError::XmlError(error) => EpubMetadataError::MalformedPackageDocument {
+            path: "package document".to_string(),
+            message: error.to_string(),
+        },
+        DocError::InvalidEpub => EpubMetadataError::MalformedPackageDocument {
+            path: "package document".to_string(),
+            message: "invalid EPUB package document".to_string(),
+        },
+    }
 }
 
-fn refined_target_id(refines: &str) -> Option<String> {
-    refines
-        .trim()
-        .strip_prefix('#')
-        .filter(|target_id| !target_id.is_empty())
+fn normalize_doc_metadata<R: std::io::Read + std::io::Seek>(
+    doc: &EpubDoc<R>,
+) -> NormalizedMetadata {
+    let SeriesSelection {
+        series,
+        series_index,
+        warnings,
+    } = select_series(&doc.metadata);
+
+    NormalizedMetadata {
+        title: first_metadata_value(&doc.metadata, "title"),
+        authors: doc
+            .metadata
+            .iter()
+            .filter(|item| item.property == "creator" && is_author(item))
+            .map(|item| item.value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        language: first_metadata_value(&doc.metadata, "language"),
+        identifiers: doc
+            .metadata
+            .iter()
+            .filter(|item| item.property == "identifier")
+            .map(|item| MetadataIdentifier {
+                value: item.value.trim().to_string(),
+                scheme: item.refinement("scheme").map(|scheme| scheme.value.clone()),
+                is_unique: doc
+                    .unique_identifier
+                    .as_deref()
+                    .is_some_and(|unique| unique == item.value.trim()),
+            })
+            .filter(|identifier| !identifier.value.is_empty())
+            .collect(),
+        series,
+        series_index,
+        warnings,
+    }
+}
+
+fn first_metadata_value(metadata: &[MetadataItem], property: &str) -> Option<String> {
+    metadata
+        .iter()
+        .find(|item| item.property == property)
+        .map(|item| item.value.trim())
+        .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
 
-fn attribute_value(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-    attribute_name: &[u8],
-) -> Result<Option<String>, String> {
-    for attribute in element.attributes() {
-        let attribute = attribute.map_err(|error| error.to_string())?;
-        if local_name(attribute.key.as_ref()) == attribute_name {
-            return attribute
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
-                .map(|value| Some(value.into_owned()))
-                .map_err(|error| error.to_string());
+fn is_author(item: &MetadataItem) -> bool {
+    let roles: Vec<&str> = item
+        .refined
+        .iter()
+        .filter(|refinement| refinement.property == "role")
+        .map(|refinement| refinement.value.as_str())
+        .collect();
+
+    roles.is_empty()
+        || roles.iter().any(|role| {
+            role.split_whitespace()
+                .any(|part| part.eq_ignore_ascii_case("aut"))
+        })
+}
+
+fn select_series(metadata: &[MetadataItem]) -> SeriesSelection {
+    let supported_epub3_series: Vec<SeriesValue> = metadata
+        .iter()
+        .filter(|item| item.property == "belongs-to-collection")
+        .filter(|item| {
+            item.refinement("collection-type")
+                .is_some_and(|collection_type| {
+                    collection_type.value.trim().eq_ignore_ascii_case("series")
+                })
+        })
+        .map(|item| SeriesValue {
+            series: item.value.trim().to_string(),
+            series_index: item
+                .refinement("group-position")
+                .map(|position| position.value.trim())
+                .filter(|position| !position.is_empty())
+                .map(ToString::to_string),
+        })
+        .filter(|series| !series.series.is_empty())
+        .collect();
+
+    let calibre = first_metadata_value(metadata, "calibre:series").map(|series| SeriesValue {
+        series,
+        series_index: first_metadata_value(metadata, "calibre:series_index"),
+    });
+
+    let mut warnings = Vec::new();
+
+    if let Some(epub3) = supported_epub3_series.first() {
+        if supported_epub3_series.len() > 1 {
+            push_warning_once(&mut warnings, AMBIGUOUS_SERIES_WARNING);
         }
-    }
+        if calibre
+            .as_ref()
+            .is_some_and(|calibre| series_values_conflict(epub3, calibre))
+        {
+            push_warning_once(&mut warnings, SERIES_CONFLICT_WARNING);
+        }
 
-    Ok(None)
-}
-
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|byte| *byte == b':' || *byte == b'}')
-        .next()
-        .unwrap_or(name)
-}
-
-#[derive(Default)]
-struct NamespaceContext {
-    stack: Vec<HashMap<String, String>>,
-}
-
-impl NamespaceContext {
-    fn push_from_element(
-        &mut self,
-        reader: &Reader<&[u8]>,
-        element: &BytesStart<'_>,
-    ) -> Result<(), String> {
-        let mut namespaces = self.stack.last().cloned().unwrap_or_default();
-        apply_namespace_declarations(reader, element, &mut namespaces)?;
-        self.stack.push(namespaces);
-        Ok(())
-    }
-
-    fn pop(&mut self) {
-        self.stack.pop();
-    }
-
-    fn namespace_uri(&self, prefix: &[u8]) -> Option<&str> {
-        let prefix = str::from_utf8(prefix).ok()?;
-        self.stack
-            .last()
-            .and_then(|namespaces| namespaces.get(prefix))
-            .map(String::as_str)
-    }
-}
-
-fn apply_namespace_declarations(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-    namespaces: &mut HashMap<String, String>,
-) -> Result<(), String> {
-    for attribute in element.attributes() {
-        let attribute = attribute.map_err(|error| error.to_string())?;
-        let key = attribute.key.as_ref();
-        let Some(prefix) = namespace_declaration_prefix(key) else {
-            continue;
+        return SeriesSelection {
+            series: Some(epub3.series.clone()),
+            series_index: epub3.series_index.clone(),
+            warnings,
         };
-        let prefix = str::from_utf8(prefix).map_err(|error| error.to_string())?;
-        let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
-            .map_err(|error| error.to_string())?;
-        namespaces.insert(prefix.to_string(), value.into_owned());
     }
 
-    Ok(())
-}
-
-fn namespace_declaration_prefix(name: &[u8]) -> Option<&[u8]> {
-    if name == b"xmlns" {
-        Some(b"")
-    } else {
-        name.strip_prefix(b"xmlns:")
-    }
-}
-
-fn dublin_core_local_name<'a>(name: &'a [u8], namespaces: &NamespaceContext) -> Option<&'a [u8]> {
-    if let Some((uri, local_name)) = expanded_name_parts(name) {
-        return (uri == DUBLIN_CORE_NAMESPACE).then_some(local_name);
-    }
-
-    let (prefix, local_name) = prefixed_name_parts(name);
-    let prefix = prefix.unwrap_or(b"");
-    namespaces
-        .namespace_uri(prefix)
-        .filter(|uri| uri.as_bytes() == DUBLIN_CORE_NAMESPACE)
-        .map(|_| local_name)
-}
-
-fn expanded_name_parts(name: &[u8]) -> Option<(&[u8], &[u8])> {
-    let separator = name.iter().position(|byte| *byte == b'}')?;
-    let uri = if name.first() == Some(&b'{') {
-        &name[1..separator]
-    } else {
-        &name[..separator]
-    };
-    let local_name = &name[separator + 1..];
-
-    if uri.is_empty() || local_name.is_empty() {
-        None
-    } else {
-        Some((uri, local_name))
-    }
-}
-
-fn prefixed_name_parts(name: &[u8]) -> (Option<&[u8]>, &[u8]) {
-    if let Some(separator) = name.iter().position(|byte| *byte == b':') {
-        (Some(&name[..separator]), &name[separator + 1..])
-    } else {
-        (None, name)
-    }
-}
-
-#[derive(Default)]
-struct ParsedPackage {
-    title: Option<String>,
-    creators: Vec<Creator>,
-    language: Option<String>,
-    identifiers: Vec<Identifier>,
-    role_refinements: HashMap<String, Vec<String>>,
-    epub3_collections: Vec<Epub3Collection>,
-    collection_refinements: HashMap<String, CollectionRefinement>,
-    calibre_series: Option<String>,
-    calibre_series_index: Option<String>,
-}
-
-impl ParsedPackage {
-    fn push_text_target(&mut self, target: TextTarget) {
-        let text = target.text.trim();
-        if text.is_empty() {
-            return;
-        }
-
-        match target.kind {
-            TextKind::Title if self.title.is_none() => self.title = Some(text.to_string()),
-            TextKind::Language if self.language.is_none() => self.language = Some(text.to_string()),
-            TextKind::Creator { id, role } => self.creators.push(Creator {
-                name: text.to_string(),
-                id,
-                role,
-            }),
-            TextKind::Identifier { id, scheme } => self.identifiers.push(Identifier {
-                value: text.to_string(),
-                id,
-                scheme,
-            }),
-            _ => {}
-        }
-    }
-
-    fn push_meta_target(&mut self, meta: MetaTarget) {
-        let text = meta.text.trim();
-        if text.is_empty() {
-            return;
-        }
-
-        match meta.kind {
-            MetaKind::RoleRefinement { creator_id } => {
-                self.role_refinements
-                    .entry(creator_id)
-                    .or_default()
-                    .push(text.to_string());
-            }
-            MetaKind::Epub3Collection { id } => self.epub3_collections.push(Epub3Collection {
-                id,
-                name: text.to_string(),
-            }),
-            MetaKind::CollectionType { collection_id } => {
-                self.collection_refinements
-                    .entry(collection_id)
-                    .or_default()
-                    .collection_type = Some(text.to_string());
-            }
-            MetaKind::GroupPosition { collection_id } => {
-                self.collection_refinements
-                    .entry(collection_id)
-                    .or_default()
-                    .group_position = Some(text.to_string());
-            }
-            MetaKind::CalibreSeries if self.calibre_series.is_none() => {
-                self.calibre_series = Some(text.to_string());
-            }
-            MetaKind::CalibreSeriesIndex if self.calibre_series_index.is_none() => {
-                self.calibre_series_index = Some(text.to_string());
-            }
-            _ => {}
-        }
-    }
-
-    fn into_normalized(self, unique_identifier_id: Option<&str>) -> NormalizedMetadata {
-        let SeriesSelection {
-            series,
-            series_index,
+    if let Some(calibre) = calibre {
+        return SeriesSelection {
+            series: Some(calibre.series),
+            series_index: calibre.series_index,
             warnings,
-        } = self.select_series();
-
-        let authors = self
-            .creators
-            .into_iter()
-            .filter(|creator| creator.is_author(&self.role_refinements))
-            .map(|creator| creator.name)
-            .collect();
-
-        let identifiers = self
-            .identifiers
-            .into_iter()
-            .map(|identifier| MetadataIdentifier {
-                is_unique: unique_identifier_id
-                    .zip(identifier.id.as_deref())
-                    .is_some_and(|(unique_id, identifier_id)| unique_id == identifier_id),
-                value: identifier.value,
-                scheme: identifier.scheme,
-            })
-            .collect();
-
-        NormalizedMetadata {
-            title: self.title,
-            authors,
-            language: self.language,
-            identifiers,
-            series,
-            series_index,
-            warnings,
-        }
+        };
     }
 
-    fn select_series(&self) -> SeriesSelection {
-        let supported_epub3_series: Vec<SeriesValue> = self
-            .epub3_collections
-            .iter()
-            .filter_map(|collection| {
-                let refinement = self.collection_refinements.get(&collection.id)?;
-                refinement
-                    .collection_type
-                    .as_deref()
-                    .is_some_and(|collection_type| {
-                        collection_type.trim().eq_ignore_ascii_case("series")
-                    })
-                    .then(|| SeriesValue {
-                        series: collection.name.clone(),
-                        series_index: refinement
-                            .group_position
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|position| !position.is_empty())
-                            .map(ToString::to_string),
-                    })
-            })
-            .collect();
-
-        let calibre = self.calibre_series.as_ref().map(|series| SeriesValue {
-            series: series.clone(),
-            series_index: self.calibre_series_index.clone(),
-        });
-
-        let mut warnings = Vec::new();
-
-        if let Some(epub3) = supported_epub3_series.first() {
-            if supported_epub3_series.len() > 1 {
-                push_warning_once(&mut warnings, AMBIGUOUS_SERIES_WARNING);
-            }
-            if calibre
-                .as_ref()
-                .is_some_and(|calibre| series_values_conflict(epub3, calibre))
-            {
-                push_warning_once(&mut warnings, SERIES_CONFLICT_WARNING);
-            }
-
-            return SeriesSelection {
-                series: Some(epub3.series.clone()),
-                series_index: epub3.series_index.clone(),
-                warnings,
-            };
-        }
-
-        if let Some(calibre) = calibre {
-            return SeriesSelection {
-                series: Some(calibre.series),
-                series_index: calibre.series_index,
-                warnings,
-            };
-        }
-
-        SeriesSelection {
-            series: None,
-            series_index: None,
-            warnings,
-        }
+    SeriesSelection {
+        series: None,
+        series_index: None,
+        warnings,
     }
-}
-
-struct TextTarget {
-    kind: TextKind,
-    text: String,
-}
-
-impl TextTarget {
-    fn new(kind: TextKind) -> Self {
-        Self {
-            kind,
-            text: String::new(),
-        }
-    }
-}
-
-enum TextKind {
-    Title,
-    Creator {
-        id: Option<String>,
-        role: Option<String>,
-    },
-    Language,
-    Identifier {
-        id: Option<String>,
-        scheme: Option<String>,
-    },
-}
-
-impl TextKind {
-    fn local_name(&self) -> &[u8] {
-        match self {
-            Self::Title => b"title",
-            Self::Creator { .. } => b"creator",
-            Self::Language => b"language",
-            Self::Identifier { .. } => b"identifier",
-        }
-    }
-}
-
-struct Creator {
-    name: String,
-    id: Option<String>,
-    role: Option<String>,
-}
-
-impl Creator {
-    fn is_author(&self, role_refinements: &HashMap<String, Vec<String>>) -> bool {
-        let mut roles = Vec::new();
-
-        if let Some(role) = &self.role {
-            roles.push(role.as_str());
-        }
-        if let Some(id) = &self.id {
-            if let Some(refined_roles) = role_refinements.get(id) {
-                roles.extend(refined_roles.iter().map(String::as_str));
-            }
-        }
-
-        roles.is_empty()
-            || roles.iter().any(|role| {
-                role.split_whitespace()
-                    .any(|part| part.eq_ignore_ascii_case("aut"))
-            })
-    }
-}
-
-struct Identifier {
-    value: String,
-    id: Option<String>,
-    scheme: Option<String>,
-}
-
-struct MetaTarget {
-    kind: MetaKind,
-    text: String,
-}
-
-enum MetaKind {
-    RoleRefinement { creator_id: String },
-    Epub3Collection { id: String },
-    CollectionType { collection_id: String },
-    GroupPosition { collection_id: String },
-    CalibreSeries,
-    CalibreSeriesIndex,
-}
-
-struct Epub3Collection {
-    id: String,
-    name: String,
-}
-
-#[derive(Default)]
-struct CollectionRefinement {
-    collection_type: Option<String>,
-    group_position: Option<String>,
 }
 
 struct SeriesValue {
@@ -839,7 +286,7 @@ mod tests {
             &epub_path,
             "OPS/content.opf",
             r##"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/" unique-identifier="book-id">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf" unique-identifier="book-id">
               <metadata>
                 <dc:title>Container Selected Title</dc:title>
                 <dc:creator opf:role="aut">Author One</dc:creator>
@@ -883,7 +330,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r#"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:custom="urn:not-dc" unique-identifier="book-id">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:custom="urn:not-dc" unique-identifier="book-id">
               <metadata>
                 <custom:title>Wrong Title</custom:title>
                 <title>Wrong Unqualified Title</title>
@@ -921,7 +368,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r#"<?xml version="1.0"?>
-            <package unique-identifier="book-id">
+            <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="book-id">
               <metadata xmlns="http://purl.org/dc/elements/1.1/">
                 <title>Default Namespace Title</title>
                 <creator>Default Namespace Author</creator>
@@ -947,7 +394,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r##"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0">
               <metadata>
                 <dc:title>Series Book</dc:title>
                 <dc:creator>Series Author</dc:creator>
@@ -974,7 +421,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r#"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/">
               <metadata>
                 <dc:title>Calibre Book</dc:title>
                 <dc:creator>Calibre Author</dc:creator>
@@ -1000,7 +447,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r##"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0">
               <metadata>
                 <dc:title>Ambiguous Book</dc:title>
                 <dc:creator>Ambiguous Author</dc:creator>
@@ -1030,7 +477,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r#"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/">
               <metadata>
                 <dc:title>Standalone Index</dc:title>
                 <dc:creator>Index Author</dc:creator>
@@ -1054,7 +501,7 @@ mod tests {
             &epub_path,
             "content.opf",
             r##"<?xml version="1.0"?>
-            <package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0">
               <metadata>
                 <dc:title>Conflict Book</dc:title>
                 <dc:creator>Conflict Author</dc:creator>
@@ -1114,7 +561,24 @@ mod tests {
         zip.write_all(b"<package><metadata><dc:title>Wrong</dc:title></metadata></package>")
             .expect("write decoy");
         zip.start_file(opf_path, options).expect("start OPF");
-        zip.write_all(opf.as_bytes()).expect("write OPF");
+        zip.write_all(add_minimal_reading_order(opf).as_bytes())
+            .expect("write OPF");
+        zip.start_file("chapter.xhtml", options)
+            .expect("start chapter");
+        zip.write_all(b"<html><body>Chapter</body></html>")
+            .expect("write chapter");
         zip.finish().expect("finish EPUB");
+    }
+
+    fn add_minimal_reading_order(opf: &str) -> String {
+        let additions = r#"
+              <manifest>
+                <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine>
+                <itemref idref="chapter"/>
+              </spine>
+        "#;
+        opf.replacen("</package>", &format!("{additions}</package>"), 1)
     }
 }
